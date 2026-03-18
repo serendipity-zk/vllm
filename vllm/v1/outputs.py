@@ -187,6 +187,12 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
+    # GPU forward time in milliseconds (measured with CUDA events)
+    gpu_forward_time_ms: float | None = None
+
+    # CPU forward-to-forward time in milliseconds (time since last forward call)
+    cpu_forward_to_forward_time_ms: float | None = None
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

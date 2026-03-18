@@ -336,15 +336,70 @@ class EngineCore:
             )
             raise err
 
-    @contextmanager
-    def log_iteration_details(self, scheduler_output: SchedulerOutput):
+    def log_iteration_details(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_output: ModelRunnerOutput | None,
+    ):
+        """Log detailed iteration metrics including GPU timing from model output."""
         if not self.vllm_config.observability_config.enable_logging_iteration_details:
-            yield
             return
+
         self._iteration_index = getattr(self, "_iteration_index", 0)
         iteration_details = compute_iteration_details(scheduler_output)
-        before = time.monotonic()
-        yield
+
+        # GPU forward time from model output (measured with CUDA events in model runner)
+        gpu_time_ms = 0.0
+        if model_output is not None and model_output.gpu_forward_time_ms is not None:
+            gpu_time_ms = model_output.gpu_forward_time_ms
+
+        # CPU forward-to-forward time (time from last forward call to this forward call)
+        cpu_forward_to_forward_ms = 0.0
+        if (model_output is not None and
+                model_output.cpu_forward_to_forward_time_ms is not None):
+            cpu_forward_to_forward_ms = model_output.cpu_forward_to_forward_time_ms
+
+        # Compute metrics similar to sglang's _collect_and_report_iteration_metrics
+        # 1. Request batch size (number of requests scheduled this iteration)
+        request_batch_size = len(scheduler_output.num_scheduled_tokens)
+
+        # 2. Token batch size (sglang formula: prefill_tokens + num_decode * 1)
+        prefill_tokens = iteration_details.num_ctx_tokens
+        decode_tokens = iteration_details.num_generation_requests
+        token_batch_size = prefill_tokens + decode_tokens
+
+        # 3. KV cache usage and tokens used
+        kv_cache_usage = 0.0
+        kv_tokens_used = 0
+        if hasattr(self.scheduler, "kv_cache_manager") and hasattr(
+            self.scheduler, "block_size"
+        ):
+            kv_mgr = self.scheduler.kv_cache_manager
+            kv_cache_usage = kv_mgr.usage
+            total_gpu_blocks = kv_mgr.block_pool.num_gpu_blocks - 1
+            block_size = self.scheduler.block_size
+            total_token_capacity = total_gpu_blocks * block_size
+            kv_tokens_used = int(kv_cache_usage * total_token_capacity)
+
+        # 4. Chunk prefill pairs: [current_chunk, cumulative_prefill]
+        prefill_chunk_pairs = []
+        for new_req in scheduler_output.scheduled_new_reqs:
+            num_computed = new_req.num_computed_tokens
+            current_chunk = scheduler_output.num_scheduled_tokens.get(
+                new_req.req_id, 0
+            )
+            if current_chunk > 0:
+                cumulative = num_computed + current_chunk
+                prefill_chunk_pairs.append([current_chunk, cumulative])
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        for i, req_id in enumerate(cached_reqs.req_ids):
+            if cached_reqs.is_context_phase(req_id):
+                num_computed = cached_reqs.num_computed_tokens[i]
+                current_chunk = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+                if current_chunk > 0:
+                    cumulative = num_computed + current_chunk
+                    prefill_chunk_pairs.append([current_chunk, cumulative])
+
         logger.info(
             "".join(
                 [
@@ -358,9 +413,21 @@ class EngineCore:
                     str(iteration_details.num_generation_requests),
                     " generation requests, ",
                     str(iteration_details.num_generation_tokens),
-                    " generation tokens, iteration elapsed time: ",
-                    format((time.monotonic() - before) * 1000, ".2f"),
+                    " generation tokens, gpu_time: ",
+                    format(gpu_time_ms, ".2f"),
+                    " ms, cpu_fwd2fwd: ",
+                    format(cpu_forward_to_forward_ms, ".2f"),
                     " ms",
+                    " | request_batch_size: ",
+                    str(request_batch_size),
+                    ", token_batch_size: ",
+                    str(token_batch_size),
+                    ", kv_cache_usage: ",
+                    format(kv_cache_usage * 100, ".2f"),
+                    "%, kv_tokens_used: ",
+                    str(kv_tokens_used),
+                    ", prefill_chunk_pairs: ",
+                    str(prefill_chunk_pairs),
                 ]
             )
         )
@@ -380,13 +447,13 @@ class EngineCore:
         scheduler_output = self.scheduler.schedule()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-        with (
-            self.log_error_detail(scheduler_output),
-            self.log_iteration_details(scheduler_output),
-        ):
+        with self.log_error_detail(scheduler_output):
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+
+        # Log iteration details with GPU timing from model output
+        self.log_iteration_details(scheduler_output, model_output)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -479,16 +546,16 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output, exec_model_fut = batch_queue.pop()
-        with (
-            self.log_error_detail(scheduler_output),
-            self.log_iteration_details(scheduler_output),
-        ):
+        with self.log_error_detail(scheduler_output):
             model_output = future.result()
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
+
+        # Log iteration details with GPU timing from model output
+        self.log_iteration_details(scheduler_output, model_output)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.

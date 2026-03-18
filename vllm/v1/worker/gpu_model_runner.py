@@ -197,9 +197,15 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         invalid_req_indices: list[int],
         async_output_copy_stream: torch.cuda.Stream,
         vocab_size: int,
+        gpu_compute_start_event: torch.cuda.Event | None = None,
+        gpu_compute_end_event: torch.cuda.Event | None = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
+
+        # GPU timing events for forward pass measurement
+        self._gpu_compute_start_event = gpu_compute_start_event
+        self._gpu_compute_end_event = gpu_compute_end_event
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
         self.async_copy_ready_event = torch.Event()
@@ -214,6 +220,11 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         default_stream = torch.cuda.current_stream()
         with torch.cuda.stream(async_output_copy_stream):
             async_output_copy_stream.wait_stream(default_stream)
+            # Explicitly wait for GPU compute end event to ensure timing events are
+            # complete before async_copy_ready_event. This handles cases where compute
+            # happens on a different stream (e.g., CUDA graphs).
+            if self._gpu_compute_end_event is not None:
+                async_output_copy_stream.wait_event(self._gpu_compute_end_event)
             self.sampled_token_ids_cpu = self._sampled_token_ids.to(
                 "cpu", non_blocking=True
             )
@@ -231,6 +242,15 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         """
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
         self.async_copy_ready_event.synchronize()
+
+        # Calculate GPU forward time after sync (both compute events are complete)
+        if (self._gpu_compute_start_event is not None and
+                self._gpu_compute_end_event is not None):
+            gpu_forward_time_ms = self._gpu_compute_start_event.elapsed_time(
+                self._gpu_compute_end_event
+            )
+        else:
+            gpu_forward_time_ms = None
 
         # Release the device tensors once the copy has completed.
         del self._logprobs_tensors
@@ -253,6 +273,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         output = self._model_runner_output
         output.sampled_token_ids = valid_sampled_token_ids
         output.logprobs = logprobs_lists
+        output.gpu_forward_time_ms = gpu_forward_time_ms
         return output
 
 
@@ -649,6 +670,15 @@ class GPUModelRunner(
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
         self._draft_token_req_ids: list[str] | None = None
         self.transfer_event = torch.Event()
+
+        # GPU timing - create new events each forward pass to avoid reuse issues in async scheduling
+        self._gpu_forward_time_ms: float | None = None
+        # CPU timing for forward-to-forward measurement
+        self._last_forward_time: float | None = None
+        self._cpu_forward_to_forward_time_ms: float | None = None
+        # Store events for current iteration (will be passed to output)
+        self._current_gpu_compute_start_event: torch.cuda.Event | None = None
+        self._current_gpu_compute_end_event: torch.cuda.Event | None = None
         self.sampled_token_ids_pinned_cpu = torch.empty(
             (self.max_num_reqs, 1),
             dtype=torch.int64,
@@ -3297,6 +3327,21 @@ class GPUModelRunner(
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
+            # Measure CPU forward-to-forward time
+            import time
+            now = time.perf_counter()
+            if self._last_forward_time is not None:
+                self._cpu_forward_to_forward_time_ms = (now - self._last_forward_time) * 1000
+            else:
+                self._cpu_forward_to_forward_time_ms = 0.0
+            self._last_forward_time = now
+
+            # Create new GPU timing events for this iteration (avoids reuse issues in async scheduling)
+            self._current_gpu_compute_start_event = torch.cuda.Event(enable_timing=True)
+            self._current_gpu_compute_end_event = torch.cuda.Event(enable_timing=True)
+
+            # Record GPU compute start event for timing
+            self._current_gpu_compute_start_event.record()
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -3304,6 +3349,8 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            # Record GPU compute end event for timing
+            self._current_gpu_compute_end_event.record()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -3528,6 +3575,8 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                gpu_forward_time_ms=self._gpu_forward_time_ms,
+                cpu_forward_to_forward_time_ms=self._cpu_forward_to_forward_time_ms,
             )
 
         if not self.use_async_scheduling:
@@ -3543,6 +3592,8 @@ class GPUModelRunner(
                 invalid_req_indices=invalid_req_indices,
                 async_output_copy_stream=self.async_output_copy_stream,
                 vocab_size=self.input_batch.vocab_size,
+                gpu_compute_start_event=self._current_gpu_compute_start_event,
+                gpu_compute_end_event=self._current_gpu_compute_end_event,
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"
@@ -5784,4 +5835,12 @@ class GPUModelRunner(
         pinned.copy_(sampled_token_ids, non_blocking=True)
         self.transfer_event.record()
         self.transfer_event.synchronize()
+        # Calculate GPU forward time after sync
+        # Explicitly sync on compute end event to handle CUDA graphs (different stream)
+        if (self._current_gpu_compute_start_event is not None and
+                self._current_gpu_compute_end_event is not None):
+            self._current_gpu_compute_end_event.synchronize()
+            self._gpu_forward_time_ms = self._current_gpu_compute_start_event.elapsed_time(
+                self._current_gpu_compute_end_event
+            )
         return pinned.tolist()
