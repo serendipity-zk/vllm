@@ -238,6 +238,10 @@ class SchedulerOutput:
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
 
+    # Engine iteration id used to align worker-side NVTX ranges with
+    # EngineCore iteration-detail logs.
+    iteration_index: int | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

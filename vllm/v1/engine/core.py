@@ -336,6 +336,12 @@ class EngineCore:
             )
             raise err
 
+    def assign_iteration_index(self, scheduler_output: SchedulerOutput) -> None:
+        """Attach a stable iteration id before sending work to workers."""
+        iteration_index = getattr(self, "_iteration_index", 0)
+        scheduler_output.iteration_index = iteration_index
+        self._iteration_index = iteration_index + 1
+
     def log_iteration_details(
         self,
         scheduler_output: SchedulerOutput,
@@ -345,7 +351,10 @@ class EngineCore:
         if not self.vllm_config.observability_config.enable_logging_iteration_details:
             return
 
-        self._iteration_index = getattr(self, "_iteration_index", 0)
+        iteration_index = scheduler_output.iteration_index
+        if iteration_index is None:
+            iteration_index = getattr(self, "_iteration_index", 0)
+            self._iteration_index = iteration_index + 1
         iteration_details = compute_iteration_details(scheduler_output)
 
         # GPU forward time from model output (measured with CUDA events in model runner)
@@ -404,7 +413,7 @@ class EngineCore:
             "".join(
                 [
                     "Iteration(",
-                    str(self._iteration_index),
+                    str(iteration_index),
                     "): ",
                     str(iteration_details.num_ctx_requests),
                     " context requests, ",
@@ -431,7 +440,6 @@ class EngineCore:
                 ]
             )
         )
-        self._iteration_index += 1
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
@@ -445,6 +453,7 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+        self.assign_iteration_index(scheduler_output)
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with self.log_error_detail(scheduler_output):
@@ -502,6 +511,7 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
+            self.assign_iteration_index(scheduler_output)
             exec_future = self.model_executor.execute_model(
                 scheduler_output, non_block=True
             )

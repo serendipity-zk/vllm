@@ -3136,6 +3136,13 @@ class GPUModelRunner(
                 pyt_hooks.register_hooks(self.model, self.model.__class__.__name__)
                 self.layerwise_nvtx_hooks_registered = True
 
+    @staticmethod
+    def _iteration_nvtx_scope(scheduler_output: "SchedulerOutput", phase: str) -> str:
+        iteration_index = getattr(scheduler_output, "iteration_index", None)
+        if iteration_index is None:
+            return f"vllm_iteration(unknown): {phase}"
+        return f"vllm_iteration({iteration_index}): {phase}"
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -3162,6 +3169,9 @@ class GPUModelRunner(
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with (
+            record_function_or_nullcontext(
+                self._iteration_nvtx_scope(scheduler_output, "preprocess")
+            ),
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
@@ -3324,6 +3334,9 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
                 skip_compiled=has_encoder_input,
             ),
+            record_function_or_nullcontext(
+                self._iteration_nvtx_scope(scheduler_output, "forward")
+            ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
@@ -3352,7 +3365,12 @@ class GPUModelRunner(
             # Record GPU compute end event for timing
             self._current_gpu_compute_end_event.record()
 
-        with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+        with (
+            record_function_or_nullcontext(
+                self._iteration_nvtx_scope(scheduler_output, "postprocess")
+            ),
+            record_function_or_nullcontext("gpu_model_runner: postprocess"),
+        ):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
                 hidden_states, aux_hidden_states = model_output
@@ -3467,7 +3485,12 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
-        with record_function_or_nullcontext("gpu_model_runner: sample"):
+        with (
+            record_function_or_nullcontext(
+                self._iteration_nvtx_scope(scheduler_output, "sample")
+            ),
+            record_function_or_nullcontext("gpu_model_runner: sample"),
+        ):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         self._draft_token_ids = None
@@ -3529,7 +3552,12 @@ class GPUModelRunner(
             else:
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
-        with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
+        with (
+            record_function_or_nullcontext(
+                self._iteration_nvtx_scope(scheduler_output, "bookkeep")
+            ),
+            record_function_or_nullcontext("gpu_model_runner: bookkeep"),
+        ):
             (
                 num_nans_in_logits,
                 logprobs_lists,
@@ -3552,7 +3580,12 @@ class GPUModelRunner(
             # tokens on the CPU, so they are run after bookkeeping.
             propose_draft_token_ids(valid_sampled_token_ids)
 
-        with record_function_or_nullcontext("gpu_model_runner: eplb"):
+        with (
+            record_function_or_nullcontext(
+                self._iteration_nvtx_scope(scheduler_output, "eplb")
+            ),
+            record_function_or_nullcontext("gpu_model_runner: eplb"),
+        ):
             self.eplb_step()
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
