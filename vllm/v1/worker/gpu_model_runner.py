@@ -53,6 +53,13 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
 )
+from vllm.model_executor.layers.fused_moe.routing_trace import (
+    dump_routing_summary as dump_moesim_routing_summary,
+    dump_token_inputs as dump_moesim_token_inputs,
+    is_enabled as is_moesim_routing_trace_enabled,
+    should_trace_token_iteration as should_trace_moesim_token_iteration,
+    should_trace_iteration as should_trace_moesim_routing_iteration,
+)
 from vllm.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding,
     XDRotaryEmbedding,
@@ -187,6 +194,16 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
+def _elapsed_cuda_event_ms(
+    start_event: torch.cuda.Event | None,
+    end_event: torch.cuda.Event | None,
+) -> float | None:
+    if start_event is None or end_event is None:
+        return None
+    end_event.synchronize()
+    return start_event.elapsed_time(end_event)
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -199,6 +216,10 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         vocab_size: int,
         gpu_compute_start_event: torch.cuda.Event | None = None,
         gpu_compute_end_event: torch.cuda.Event | None = None,
+        gpu_postprocess_start_event: torch.cuda.Event | None = None,
+        gpu_postprocess_end_event: torch.cuda.Event | None = None,
+        gpu_sample_start_event: torch.cuda.Event | None = None,
+        gpu_sample_end_event: torch.cuda.Event | None = None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
@@ -206,6 +227,10 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         # GPU timing events for forward pass measurement
         self._gpu_compute_start_event = gpu_compute_start_event
         self._gpu_compute_end_event = gpu_compute_end_event
+        self._gpu_postprocess_start_event = gpu_postprocess_start_event
+        self._gpu_postprocess_end_event = gpu_postprocess_end_event
+        self._gpu_sample_start_event = gpu_sample_start_event
+        self._gpu_sample_end_event = gpu_sample_end_event
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
         self.async_copy_ready_event = torch.Event()
@@ -243,7 +268,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
         self.async_copy_ready_event.synchronize()
 
-        # Calculate GPU forward time after sync (both compute events are complete)
+        # Calculate GPU timing after sync (all timing events are complete).
         if (self._gpu_compute_start_event is not None and
                 self._gpu_compute_end_event is not None):
             gpu_forward_time_ms = self._gpu_compute_start_event.elapsed_time(
@@ -251,6 +276,18 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
             )
         else:
             gpu_forward_time_ms = None
+        gpu_postprocess_time_ms = _elapsed_cuda_event_ms(
+            self._gpu_postprocess_start_event, self._gpu_postprocess_end_event
+        )
+        gpu_sample_time_ms = _elapsed_cuda_event_ms(
+            self._gpu_sample_start_event, self._gpu_sample_end_event
+        )
+        gpu_forward_postprocess_time_ms = _elapsed_cuda_event_ms(
+            self._gpu_compute_start_event, self._gpu_postprocess_end_event
+        )
+        gpu_forward_sample_time_ms = _elapsed_cuda_event_ms(
+            self._gpu_compute_start_event, self._gpu_sample_end_event
+        )
 
         # Release the device tensors once the copy has completed.
         del self._logprobs_tensors
@@ -274,6 +311,11 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         output.sampled_token_ids = valid_sampled_token_ids
         output.logprobs = logprobs_lists
         output.gpu_forward_time_ms = gpu_forward_time_ms
+        output.gpu_model_forward_time_ms = gpu_forward_time_ms
+        output.gpu_postprocess_time_ms = gpu_postprocess_time_ms
+        output.gpu_sample_time_ms = gpu_sample_time_ms
+        output.gpu_forward_postprocess_time_ms = gpu_forward_postprocess_time_ms
+        output.gpu_forward_sample_time_ms = gpu_forward_sample_time_ms
         return output
 
 
@@ -673,12 +715,21 @@ class GPUModelRunner(
 
         # GPU timing - create new events each forward pass to avoid reuse issues in async scheduling
         self._gpu_forward_time_ms: float | None = None
+        self._gpu_model_forward_time_ms: float | None = None
+        self._gpu_postprocess_time_ms: float | None = None
+        self._gpu_sample_time_ms: float | None = None
+        self._gpu_forward_postprocess_time_ms: float | None = None
+        self._gpu_forward_sample_time_ms: float | None = None
         # CPU timing for forward-to-forward measurement
         self._last_forward_time: float | None = None
         self._cpu_forward_to_forward_time_ms: float | None = None
         # Store events for current iteration (will be passed to output)
         self._current_gpu_compute_start_event: torch.cuda.Event | None = None
         self._current_gpu_compute_end_event: torch.cuda.Event | None = None
+        self._current_gpu_postprocess_start_event: torch.cuda.Event | None = None
+        self._current_gpu_postprocess_end_event: torch.cuda.Event | None = None
+        self._current_gpu_sample_start_event: torch.cuda.Event | None = None
+        self._current_gpu_sample_end_event: torch.cuda.Event | None = None
         self.sampled_token_ids_pinned_cpu = torch.empty(
             (self.max_num_reqs, 1),
             dtype=torch.int64,
@@ -3155,7 +3206,16 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
-        if self.vllm_config.model_config.enable_return_routed_experts:
+        trace_moesim_routing = should_trace_moesim_routing_iteration(
+            getattr(scheduler_output, "iteration_index", None)
+        )
+        trace_moesim_tokens = should_trace_moesim_token_iteration(
+            getattr(scheduler_output, "iteration_index", None)
+        )
+        if (
+            self.vllm_config.model_config.enable_return_routed_experts
+            or trace_moesim_routing
+        ):
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
                 capturer.clear_buffer()  # noqa
@@ -3305,6 +3365,17 @@ class GPUModelRunner(
             ) = self._preprocess(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
+            if trace_moesim_tokens:
+                dump_moesim_token_inputs(
+                    iteration_index=getattr(
+                        scheduler_output, "iteration_index", None
+                    ),
+                    input_ids=input_ids,
+                    req_ids=list(req_ids),
+                    num_scheduled_tokens=num_scheduled_tokens_np,
+                    num_tokens=num_tokens_unpadded,
+                    positions=self.positions.cpu,
+                )
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -3352,6 +3423,10 @@ class GPUModelRunner(
             # Create new GPU timing events for this iteration (avoids reuse issues in async scheduling)
             self._current_gpu_compute_start_event = torch.cuda.Event(enable_timing=True)
             self._current_gpu_compute_end_event = torch.cuda.Event(enable_timing=True)
+            self._current_gpu_postprocess_start_event = torch.cuda.Event(enable_timing=True)
+            self._current_gpu_postprocess_end_event = torch.cuda.Event(enable_timing=True)
+            self._current_gpu_sample_start_event = torch.cuda.Event(enable_timing=True)
+            self._current_gpu_sample_end_event = torch.cuda.Event(enable_timing=True)
 
             # Record GPU compute start event for timing
             self._current_gpu_compute_start_event.record()
@@ -3364,6 +3439,21 @@ class GPUModelRunner(
             )
             # Record GPU compute end event for timing
             self._current_gpu_compute_end_event.record()
+            if trace_moesim_routing:
+                capturer = RoutedExpertsCapturer.get_instance()
+                if capturer is not None:
+                    dump_moesim_routing_summary(
+                        capturer=capturer,
+                        static_forward_context=(
+                            self.compilation_config.static_forward_context
+                        ),
+                        iteration_index=getattr(
+                            scheduler_output, "iteration_index", None
+                        ),
+                        num_tokens=num_scheduled_tokens,
+                    )
+                else:
+                    logger.error("RoutedExpertsCapturer not initialized.")
 
         with (
             record_function_or_nullcontext(
@@ -3371,6 +3461,8 @@ class GPUModelRunner(
             ),
             record_function_or_nullcontext("gpu_model_runner: postprocess"),
         ):
+            if self._current_gpu_postprocess_start_event is not None:
+                self._current_gpu_postprocess_start_event.record()
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
                 hidden_states, aux_hidden_states = model_output
@@ -3386,16 +3478,21 @@ class GPUModelRunner(
                     assert isinstance(hidden_states, IntermediateTensors)
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
+                    if self._current_gpu_postprocess_end_event is not None:
+                        self._current_gpu_postprocess_end_event.record()
                     return hidden_states
 
                 if self.is_pooling_model:
                     # Return the pooling output.
-                    return self._pool(
+                    pool_output = self._pool(
                         hidden_states,
                         num_scheduled_tokens,
                         num_scheduled_tokens_np,
                         kv_connector_output,
                     )
+                    if self._current_gpu_postprocess_end_event is not None:
+                        self._current_gpu_postprocess_end_event.record()
+                    return pool_output
 
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
@@ -3428,6 +3525,8 @@ class GPUModelRunner(
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+            if self._current_gpu_postprocess_end_event is not None:
+                self._current_gpu_postprocess_end_event.record()
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
@@ -3491,7 +3590,11 @@ class GPUModelRunner(
             ),
             record_function_or_nullcontext("gpu_model_runner: sample"),
         ):
+            if self._current_gpu_sample_start_event is not None:
+                self._current_gpu_sample_start_event.record()
             sampler_output = self._sample(logits, spec_decode_metadata)
+            if self._current_gpu_sample_end_event is not None:
+                self._current_gpu_sample_end_event.record()
 
         self._draft_token_ids = None
         self._draft_token_req_ids = None
@@ -3596,6 +3699,17 @@ class GPUModelRunner(
                 else:
                     logger.error("RoutedExpertsCapturer not initialized.")
 
+            if self.use_async_scheduling:
+                gpu_timing = {
+                    "gpu_forward_time_ms": None,
+                    "gpu_model_forward_time_ms": None,
+                    "gpu_postprocess_time_ms": None,
+                    "gpu_sample_time_ms": None,
+                    "gpu_forward_postprocess_time_ms": None,
+                    "gpu_forward_sample_time_ms": None,
+                }
+            else:
+                gpu_timing = self._collect_gpu_iteration_timing()
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -3608,7 +3722,14 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
-                gpu_forward_time_ms=self._gpu_forward_time_ms,
+                gpu_forward_time_ms=gpu_timing["gpu_forward_time_ms"],
+                gpu_model_forward_time_ms=gpu_timing["gpu_model_forward_time_ms"],
+                gpu_postprocess_time_ms=gpu_timing["gpu_postprocess_time_ms"],
+                gpu_sample_time_ms=gpu_timing["gpu_sample_time_ms"],
+                gpu_forward_postprocess_time_ms=(
+                    gpu_timing["gpu_forward_postprocess_time_ms"]
+                ),
+                gpu_forward_sample_time_ms=gpu_timing["gpu_forward_sample_time_ms"],
                 cpu_forward_to_forward_time_ms=self._cpu_forward_to_forward_time_ms,
             )
 
@@ -3627,6 +3748,12 @@ class GPUModelRunner(
                 vocab_size=self.input_batch.vocab_size,
                 gpu_compute_start_event=self._current_gpu_compute_start_event,
                 gpu_compute_end_event=self._current_gpu_compute_end_event,
+                gpu_postprocess_start_event=(
+                    self._current_gpu_postprocess_start_event
+                ),
+                gpu_postprocess_end_event=self._current_gpu_postprocess_end_event,
+                gpu_sample_start_event=self._current_gpu_sample_start_event,
+                gpu_sample_end_event=self._current_gpu_sample_end_event,
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"
@@ -5777,7 +5904,10 @@ class GPUModelRunner(
                 kv_transfer_group.register_kv_caches(kv_caches)
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
 
-        if self.model_config.enable_return_routed_experts:
+        if (
+            self.model_config.enable_return_routed_experts
+            or is_moesim_routing_trace_enabled()
+        ):
             self.init_routed_experts_capturer()
 
     def init_routed_experts_capturer(self):
@@ -5876,4 +6006,36 @@ class GPUModelRunner(
             self._gpu_forward_time_ms = self._current_gpu_compute_start_event.elapsed_time(
                 self._current_gpu_compute_end_event
             )
+            self._gpu_model_forward_time_ms = self._gpu_forward_time_ms
         return pinned.tolist()
+
+    def _collect_gpu_iteration_timing(self) -> dict[str, float | None]:
+        self._gpu_model_forward_time_ms = _elapsed_cuda_event_ms(
+            self._current_gpu_compute_start_event,
+            self._current_gpu_compute_end_event,
+        )
+        self._gpu_forward_time_ms = self._gpu_model_forward_time_ms
+        self._gpu_postprocess_time_ms = _elapsed_cuda_event_ms(
+            self._current_gpu_postprocess_start_event,
+            self._current_gpu_postprocess_end_event,
+        )
+        self._gpu_sample_time_ms = _elapsed_cuda_event_ms(
+            self._current_gpu_sample_start_event,
+            self._current_gpu_sample_end_event,
+        )
+        self._gpu_forward_postprocess_time_ms = _elapsed_cuda_event_ms(
+            self._current_gpu_compute_start_event,
+            self._current_gpu_postprocess_end_event,
+        )
+        self._gpu_forward_sample_time_ms = _elapsed_cuda_event_ms(
+            self._current_gpu_compute_start_event,
+            self._current_gpu_sample_end_event,
+        )
+        return {
+            "gpu_forward_time_ms": self._gpu_forward_time_ms,
+            "gpu_model_forward_time_ms": self._gpu_model_forward_time_ms,
+            "gpu_postprocess_time_ms": self._gpu_postprocess_time_ms,
+            "gpu_sample_time_ms": self._gpu_sample_time_ms,
+            "gpu_forward_postprocess_time_ms": self._gpu_forward_postprocess_time_ms,
+            "gpu_forward_sample_time_ms": self._gpu_forward_sample_time_ms,
+        }

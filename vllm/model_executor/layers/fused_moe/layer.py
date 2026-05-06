@@ -43,6 +43,9 @@ from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
 )
+from vllm.model_executor.layers.fused_moe.routing_trace import (
+    is_enabled as is_moesim_routing_trace_enabled,
+)
 from vllm.model_executor.layers.fused_moe.router.router_factory import (
     create_fused_moe_router,
 )
@@ -522,12 +525,20 @@ class FusedMoE(CustomOp):
         capture: Callable[[torch.Tensor], None] | None = None
         if (
             self.vllm_config.model_config is not None
-            and self.vllm_config.model_config.enable_return_routed_experts
+            and (
+                self.vllm_config.model_config.enable_return_routed_experts
+                or is_moesim_routing_trace_enabled()
+            )
         ):
-            # In dummy runs, the capturer is not initialized.
-            capturer = RoutedExpertsCapturer.get_instance()
-            if capturer is not None:
-                capture = lambda topk_ids: capturer.capture(self.layer_id, topk_ids)
+            def capture_topk_ids(topk_ids: torch.Tensor) -> None:
+                capturer = RoutedExpertsCapturer.get_instance()
+                if (
+                    capturer is not None
+                    and getattr(capturer, "_device_buffer", None) is not None
+                ):
+                    capturer.capture(self.layer_id, topk_ids)
+
+            capture = capture_topk_ids
 
         self.router = create_fused_moe_router(
             top_k=top_k,

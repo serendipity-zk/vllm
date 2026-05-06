@@ -190,6 +190,13 @@ class ModelRunnerOutput:
     # GPU forward time in milliseconds (measured with CUDA events)
     gpu_forward_time_ms: float | None = None
 
+    # Fine-grained GPU times in milliseconds (measured with CUDA events)
+    gpu_model_forward_time_ms: float | None = None
+    gpu_postprocess_time_ms: float | None = None
+    gpu_sample_time_ms: float | None = None
+    gpu_forward_postprocess_time_ms: float | None = None
+    gpu_forward_sample_time_ms: float | None = None
+
     # CPU forward-to-forward time in milliseconds (time since last forward call)
     cpu_forward_to_forward_time_ms: float | None = None
 

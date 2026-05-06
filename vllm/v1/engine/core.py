@@ -361,6 +361,35 @@ class EngineCore:
         gpu_time_ms = 0.0
         if model_output is not None and model_output.gpu_forward_time_ms is not None:
             gpu_time_ms = model_output.gpu_forward_time_ms
+        gpu_model_forward_time_ms = 0.0
+        if (
+            model_output is not None
+            and model_output.gpu_model_forward_time_ms is not None
+        ):
+            gpu_model_forward_time_ms = model_output.gpu_model_forward_time_ms
+        gpu_postprocess_time_ms = 0.0
+        if (
+            model_output is not None
+            and model_output.gpu_postprocess_time_ms is not None
+        ):
+            gpu_postprocess_time_ms = model_output.gpu_postprocess_time_ms
+        gpu_sample_time_ms = 0.0
+        if model_output is not None and model_output.gpu_sample_time_ms is not None:
+            gpu_sample_time_ms = model_output.gpu_sample_time_ms
+        gpu_forward_postprocess_time_ms = 0.0
+        if (
+            model_output is not None
+            and model_output.gpu_forward_postprocess_time_ms is not None
+        ):
+            gpu_forward_postprocess_time_ms = (
+                model_output.gpu_forward_postprocess_time_ms
+            )
+        gpu_forward_sample_time_ms = 0.0
+        if (
+            model_output is not None
+            and model_output.gpu_forward_sample_time_ms is not None
+        ):
+            gpu_forward_sample_time_ms = model_output.gpu_forward_sample_time_ms
 
         # CPU forward-to-forward time (time from last forward call to this forward call)
         cpu_forward_to_forward_ms = 0.0
@@ -426,6 +455,17 @@ class EngineCore:
                     format(gpu_time_ms, ".2f"),
                     " ms, cpu_fwd2fwd: ",
                     format(cpu_forward_to_forward_ms, ".2f"),
+                    " ms",
+                    ", gpu_model_forward_time: ",
+                    format(gpu_model_forward_time_ms, ".2f"),
+                    " ms, gpu_postprocess_time: ",
+                    format(gpu_postprocess_time_ms, ".2f"),
+                    " ms, gpu_sample_time: ",
+                    format(gpu_sample_time_ms, ".2f"),
+                    " ms, gpu_forward_postprocess_time: ",
+                    format(gpu_forward_postprocess_time_ms, ".2f"),
+                    " ms, gpu_forward_sample_time: ",
+                    format(gpu_forward_sample_time_ms, ".2f"),
                     " ms",
                     " | request_batch_size: ",
                     str(request_batch_size),
