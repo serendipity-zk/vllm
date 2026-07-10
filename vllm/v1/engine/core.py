@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import os
 import queue
 import signal
@@ -401,25 +402,15 @@ class EngineCore:
         # 1. Request batch size (number of requests scheduled this iteration)
         request_batch_size = len(scheduler_output.num_scheduled_tokens)
 
-        # 2. Token batch size (sglang formula: prefill_tokens + num_decode * 1)
+        # 2. Token composition of the model batch.
         prefill_tokens = iteration_details.num_ctx_tokens
         decode_tokens = iteration_details.num_generation_requests
-        token_batch_size = prefill_tokens + decode_tokens
 
-        # 3. KV cache usage and tokens used
-        kv_cache_usage = 0.0
-        kv_tokens_used = 0
-        if hasattr(self.scheduler, "kv_cache_manager") and hasattr(
-            self.scheduler, "block_size"
-        ):
-            kv_mgr = self.scheduler.kv_cache_manager
-            kv_cache_usage = kv_mgr.usage
-            total_gpu_blocks = kv_mgr.block_pool.num_gpu_blocks - 1
-            block_size = self.scheduler.block_size
-            total_token_capacity = total_gpu_blocks * block_size
-            kv_tokens_used = int(kv_cache_usage * total_token_capacity)
-
-        # 4. Chunk prefill pairs: [current_chunk, cumulative_prefill]
+        # 3. Canonical model inputs for VibeSim timing-predict. Keep the exact
+        # per-request shape at this boundary; a later typed adapter owns any
+        # deployment-specific grouping. Pairs are (existing prefix, appended
+        # tokens), matching ArchGroupInput/FlashInfer rather than the historical
+        # (chunk, cumulative) visualization tuple.
         prefill_chunk_pairs = []
         for new_req in scheduler_output.scheduled_new_reqs:
             num_computed = new_req.num_computed_tokens
@@ -427,16 +418,40 @@ class EngineCore:
                 new_req.req_id, 0
             )
             if current_chunk > 0:
-                cumulative = num_computed + current_chunk
-                prefill_chunk_pairs.append([current_chunk, cumulative])
+                prefill_chunk_pairs.append([num_computed, current_chunk])
         cached_reqs = scheduler_output.scheduled_cached_reqs
         for i, req_id in enumerate(cached_reqs.req_ids):
             if cached_reqs.is_context_phase(req_id):
                 num_computed = cached_reqs.num_computed_tokens[i]
                 current_chunk = scheduler_output.num_scheduled_tokens.get(req_id, 0)
                 if current_chunk > 0:
-                    cumulative = num_computed + current_chunk
-                    prefill_chunk_pairs.append([current_chunk, cumulative])
+                    prefill_chunk_pairs.append([num_computed, current_chunk])
+
+        # Decode attention consumes the KV length that existed before this
+        # iteration's query token. `num_computed_tokens` is that exact value.
+        decode_kv_lens = [
+            cached_reqs.num_computed_tokens[i]
+            for i, req_id in enumerate(cached_reqs.req_ids)
+            if not cached_reqs.is_context_phase(req_id)
+            and scheduler_output.num_scheduled_tokens.get(req_id, 0) > 0
+        ]
+
+        alignment_record = {
+            "schema_version": 1,
+            "input_adapter": "vllm_text",
+            "iteration_index": iteration_index,
+            "request_batch_size": request_batch_size,
+            "prefill_tokens": prefill_tokens,
+            "decode_requests": decode_tokens,
+            "decode_tokens_scheduled": iteration_details.num_generation_tokens,
+            "prefill_chunk_pairs": prefill_chunk_pairs,
+            "decode_kv_lens": decode_kv_lens,
+            "gpu_time_ms": gpu_time_ms,
+            "gpu_model_forward_time_ms": gpu_model_forward_time_ms,
+            "gpu_postprocess_time_ms": gpu_postprocess_time_ms,
+            "gpu_sample_time_ms": gpu_sample_time_ms,
+            "cpu_forward_to_forward_ms": cpu_forward_to_forward_ms,
+        }
 
         logger.info(
             "".join(
@@ -467,18 +482,15 @@ class EngineCore:
                     " ms, gpu_forward_sample_time: ",
                     format(gpu_forward_sample_time_ms, ".2f"),
                     " ms",
-                    " | request_batch_size: ",
-                    str(request_batch_size),
-                    ", token_batch_size: ",
-                    str(token_batch_size),
-                    ", kv_cache_usage: ",
-                    format(kv_cache_usage * 100, ".2f"),
-                    "%, kv_tokens_used: ",
-                    str(kv_tokens_used),
-                    ", prefill_chunk_pairs: ",
-                    str(prefill_chunk_pairs),
                 ]
             )
+        )
+        # Machine-readable contract consumed by alignment/profiler/vllm_server.py.
+        # It deliberately lives on its own line so human log wording can evolve
+        # without breaking the analyzer input conversion.
+        logger.info(
+            "VibeSimAlignmentIteration %s",
+            json.dumps(alignment_record, separators=(",", ":")),
         )
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:

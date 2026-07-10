@@ -3189,6 +3189,13 @@ class GPUModelRunner(
 
     @staticmethod
     def _iteration_nvtx_scope(scheduler_output: "SchedulerOutput", phase: str) -> str:
+        """Return the fork's canonical, triggerable per-iteration phase marker.
+
+        Keep this as inline indexed text: Nsight capture triggers and alignment
+        attribution both depend on it. Do not nest the legacy unindexed
+        ``gpu_model_runner: <phase>`` alias around the same work; it carries no
+        additional information and makes every phase appear twice.
+        """
         iteration_index = getattr(scheduler_output, "iteration_index", None)
         if iteration_index is None:
             return f"vllm_iteration(unknown): {phase}"
@@ -3232,7 +3239,6 @@ class GPUModelRunner(
             record_function_or_nullcontext(
                 self._iteration_nvtx_scope(scheduler_output, "preprocess")
             ),
-            record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
             # Update persistent batch states.
@@ -3408,7 +3414,6 @@ class GPUModelRunner(
             record_function_or_nullcontext(
                 self._iteration_nvtx_scope(scheduler_output, "forward")
             ),
-            record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
             # Measure CPU forward-to-forward time
@@ -3459,7 +3464,6 @@ class GPUModelRunner(
             record_function_or_nullcontext(
                 self._iteration_nvtx_scope(scheduler_output, "postprocess")
             ),
-            record_function_or_nullcontext("gpu_model_runner: postprocess"),
         ):
             if self._current_gpu_postprocess_start_event is not None:
                 self._current_gpu_postprocess_start_event.record()
@@ -3588,7 +3592,6 @@ class GPUModelRunner(
             record_function_or_nullcontext(
                 self._iteration_nvtx_scope(scheduler_output, "sample")
             ),
-            record_function_or_nullcontext("gpu_model_runner: sample"),
         ):
             if self._current_gpu_sample_start_event is not None:
                 self._current_gpu_sample_start_event.record()
@@ -3659,7 +3662,6 @@ class GPUModelRunner(
             record_function_or_nullcontext(
                 self._iteration_nvtx_scope(scheduler_output, "bookkeep")
             ),
-            record_function_or_nullcontext("gpu_model_runner: bookkeep"),
         ):
             (
                 num_nans_in_logits,
@@ -3687,7 +3689,6 @@ class GPUModelRunner(
             record_function_or_nullcontext(
                 self._iteration_nvtx_scope(scheduler_output, "eplb")
             ),
-            record_function_or_nullcontext("gpu_model_runner: eplb"),
         ):
             self.eplb_step()
 
