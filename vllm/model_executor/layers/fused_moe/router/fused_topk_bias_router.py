@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
 from collections.abc import Callable
 
 import torch
@@ -10,7 +11,10 @@ from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.layers.batch_invariant import (
     vllm_is_batch_invariant,
 )
-from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+from vllm.model_executor.layers.fused_moe.config import (
+    RoutingMethodType,
+    get_routing_method_type,
+)
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 
 
@@ -52,6 +56,19 @@ def vllm_topk_sigmoid(
     )
 
     return topk_weights, topk_indices
+
+
+@functools.lru_cache(maxsize=8)
+def _aiter_get_num_expert_group(num_experts: int) -> int:
+    _AITER_MAX_EXPERTS_PER_GROUP = 32
+    g = max(1, -(-num_experts // _AITER_MAX_EXPERTS_PER_GROUP))
+    while num_experts % g != 0:
+        g += 1
+    assert num_experts % g == 0, f"{num_experts=} not divisible by {g=}"
+    assert num_experts // g <= _AITER_MAX_EXPERTS_PER_GROUP, (
+        f"group size {num_experts // g} exceeds limit {_AITER_MAX_EXPERTS_PER_GROUP}"
+    )
+    return g
 
 
 def fused_topk_bias(
@@ -105,6 +122,30 @@ def fused_topk_bias(
             return topk_weights, topk_ids
         else:
             raise ValueError(f"Unsupported scoring function: {scoring_func}")
+    elif rocm_aiter_ops.is_fused_moe_enabled() and scoring_func == "sigmoid":
+        M = hidden_states.size(0)
+        num_experts = gating_output.shape[-1]
+        num_expert_group = _aiter_get_num_expert_group(num_experts)
+        if topk >= num_expert_group:
+            topk_weights = torch.empty(
+                M, topk, dtype=torch.float32, device=hidden_states.device
+            )
+            topk_ids = torch.empty(
+                M,
+                topk,
+                dtype=torch.int32 if indices_type is None else indices_type,
+                device=hidden_states.device,
+            )
+            rocm_aiter_ops.biased_grouped_topk(
+                gating_output,
+                e_score_correction_bias.to(gating_output.dtype),
+                topk_weights,
+                topk_ids,
+                num_expert_group=num_expert_group,
+                topk_group=num_expert_group,
+                need_renorm=renormalize,
+            )
+            return topk_weights, topk_ids
 
     n_routed_experts = gating_output.shape[-1]
     if scoring_func == "softmax":
@@ -124,7 +165,9 @@ def fused_topk_bias(
     topk_weights = scores.gather(1, topk_indices)
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-    return topk_weights.to(torch.float32), topk_indices.to(torch.int32)
+    return topk_weights.to(torch.float32), topk_indices.to(
+        torch.int32 if indices_type is None else indices_type
+    )
 
 
 class FusedTopKBiasRouter(BaseRouter):
@@ -156,10 +199,12 @@ class FusedTopKBiasRouter(BaseRouter):
 
     @property
     def routing_method_type(self) -> RoutingMethodType:
-        return (
-            RoutingMethodType.Renormalize
-            if not self.renormalize
-            else RoutingMethodType.RenormalizeNaive
+        return get_routing_method_type(
+            scoring_func=self.scoring_func,
+            top_k=self.top_k,
+            renormalize=self.renormalize,
+            num_expert_group=None,
+            has_e_score_bias=True,
         )
 
     def _compute_routing(
@@ -176,6 +221,7 @@ class FusedTopKBiasRouter(BaseRouter):
             topk=self.top_k,
             renormalize=self.renormalize,
             scoring_func=self.scoring_func,
+            indices_type=indices_type,
         )
 
         if self.routed_scaling_factor != 1.0:
