@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
+import json
 import os
 import queue
 import signal
@@ -408,13 +409,15 @@ class EngineCore:
         if scheduler_output and scheduler_output.total_num_scheduled_tokens == 0:
             yield
             return
-        self._iteration_index = getattr(self, "_iteration_index", 0)
         # scheduler_output=None marks a DP dummy iteration.
         if scheduler_output is None:
             iteration_details = IterationDetails(0, 0, 0, 0)
+            iteration_index = -1
             is_dummy = True
         else:
             iteration_details = compute_iteration_details(scheduler_output)
+            assert scheduler_output.alignment_iteration_index is not None
+            iteration_index = scheduler_output.alignment_iteration_index
             is_dummy = False
         before = time.monotonic()
         yield
@@ -422,7 +425,7 @@ class EngineCore:
             "".join(
                 [
                     "Iteration(",
-                    str(self._iteration_index),
+                    str(iteration_index),
                     "): ",
                     str(iteration_details.num_ctx_requests),
                     " context requests, ",
@@ -438,7 +441,57 @@ class EngineCore:
                 ]
             )
         )
-        self._iteration_index += 1
+        if scheduler_output is not None:
+            cached_requests = scheduler_output.scheduled_cached_reqs
+            prefill_chunk_pairs = []
+            for new_request in scheduler_output.scheduled_new_reqs:
+                appended_tokens = scheduler_output.num_scheduled_tokens.get(
+                    new_request.req_id, 0
+                )
+                if appended_tokens > 0:
+                    prefill_chunk_pairs.append(
+                        [new_request.num_computed_tokens, appended_tokens]
+                    )
+            for request_index, request_id in enumerate(cached_requests.req_ids):
+                if cached_requests.is_context_phase(request_id):
+                    appended_tokens = scheduler_output.num_scheduled_tokens.get(
+                        request_id, 0
+                    )
+                    if appended_tokens > 0:
+                        prefill_chunk_pairs.append(
+                            [
+                                cached_requests.num_computed_tokens[request_index],
+                                appended_tokens,
+                            ]
+                        )
+            decode_kv_lens = [
+                cached_requests.num_computed_tokens[request_index]
+                for request_index, request_id in enumerate(cached_requests.req_ids)
+                if not cached_requests.is_context_phase(request_id)
+                and scheduler_output.num_scheduled_tokens.get(request_id, 0) > 0
+            ]
+            alignment_record = {
+                "schema_version": 1,
+                "input_adapter": "vllm_text",
+                "iteration_index": iteration_index,
+                "prefill_tokens": iteration_details.num_ctx_tokens,
+                "decode_requests": iteration_details.num_generation_requests,
+                "decode_tokens_scheduled": iteration_details.num_generation_tokens,
+                "prefill_chunk_pairs": prefill_chunk_pairs,
+                "decode_kv_lens": decode_kv_lens,
+            }
+            logger.info(
+                "VibeSimAlignmentIteration %s",
+                json.dumps(alignment_record, separators=(",", ":")),
+            )
+
+    def assign_alignment_iteration_index(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        """Attach one dispatch-order index shared by EngineCore logs and worker NVTX."""
+        next_index = getattr(self, "_next_alignment_iteration_index", 0)
+        scheduler_output.alignment_iteration_index = next_index
+        self._next_alignment_iteration_index = next_index + 1
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
@@ -452,6 +505,7 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+        self.assign_alignment_iteration_index(scheduler_output)
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -510,6 +564,7 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
+            self.assign_alignment_iteration_index(scheduler_output)
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
