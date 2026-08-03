@@ -4032,8 +4032,10 @@ class GPUModelRunner(
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        iteration_index = scheduler_output.alignment_iteration_index
+        iteration_prefix = f"vllm_iteration({iteration_index})"
         with (
-            record_function_or_nullcontext("gpu_model_runner: preprocess"),
+            record_function_or_nullcontext(f"{iteration_prefix}: preprocess"),
             self.synchronize_input_prep(),
         ):
             # Update persistent batch states.
@@ -4260,7 +4262,7 @@ class GPUModelRunner(
                 skip_compiled=has_encoder_input,
                 is_padding=is_padding,
             ),
-            record_function_or_nullcontext("gpu_model_runner: forward"),
+            record_function_or_nullcontext(f"{iteration_prefix}: forward"),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
                 defer_finalize=defer_kv_connector_finalize,
@@ -4274,7 +4276,7 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
-        with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+        with record_function_or_nullcontext(f"{iteration_prefix}: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
                 hidden_states, aux_hidden_states = model_output
@@ -4391,6 +4393,9 @@ class GPUModelRunner(
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+        iteration_prefix = (
+            f"vllm_iteration({scheduler_output.alignment_iteration_index})"
+        )
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -4398,7 +4403,7 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
-        with record_function_or_nullcontext("gpu_model_runner: sample"):
+        with record_function_or_nullcontext(f"{iteration_prefix}: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         self._update_states_after_model_execute(
@@ -4526,7 +4531,7 @@ class GPUModelRunner(
                 self._draft_prob_req_ids = None
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
-        with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
+        with record_function_or_nullcontext(f"{iteration_prefix}: bookkeep"):
             (
                 num_nans_in_logits,
                 num_nans_device,
@@ -4570,7 +4575,7 @@ class GPUModelRunner(
         if spec_config is not None:
             self.finalize_kv_connector()
 
-        with record_function_or_nullcontext("gpu_model_runner: eplb"):
+        with record_function_or_nullcontext(f"{iteration_prefix}: eplb"):
             self.eplb_step()
 
         # self.kv_connector_output may be modified during drafting

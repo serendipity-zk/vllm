@@ -25,6 +25,7 @@ MoE layer. If we have 32 EP ranks, then each GPU will hold 288 / 32 = 9 local
 physical experts.
 """
 
+import json
 import threading
 import time
 from collections import deque
@@ -280,10 +281,17 @@ class EplbState:
         self._should_record_value: bool | None = None
         """Last value written to ``should_record_tensor``."""
         self._pending_balancedness: deque[
-            tuple[int, int, torch.Event, list[tuple[str, torch.Tensor]]]
+            tuple[
+                int,
+                int,
+                torch.Event,
+                list[tuple[str, torch.Tensor]],
+                list[tuple[dict, torch.Tensor]],
+            ]
         ] = deque()
         """Balancedness stats whose copies to the host are in flight, oldest
-        first."""
+        first. The last element holds alignment expert-load records and their
+        in-flight logical expert counts."""
         self.is_async: bool = False
         """
         The flag indicates whether the EPLB is running in async mode.
@@ -637,6 +645,7 @@ class EplbState:
             ep_group = get_ep_group().device_group
             if ep_group.rank() == 0:
                 stats: list[tuple[str, torch.Tensor]] = []
+                alignment_records: list[tuple[dict, torch.Tensor]] = []
                 for expert_load_pass, eplb_model_state in zip(
                     expert_load_pass_list, self.model_states.values()
                 ):
@@ -662,6 +671,34 @@ class EplbState:
                             tokens.to("cpu", non_blocking=True),
                         )
                     )
+                    # Machine-readable alignment-only routing evidence.  EPLB
+                    # logging is default-off; when explicitly enabled for the
+                    # popularity pass, map synchronized physical loads back to
+                    # stable logical expert ids before the mapping can change.
+                    # The counts reach the host with the balancedness copy.
+                    physical_to_logical = eplb_model_state.physical_to_logical_map
+                    logical_expert_load = torch.zeros(
+                        (
+                            expert_load_pass.shape[0],
+                            eplb_model_state.model.num_logical_experts,
+                        ),
+                        dtype=expert_load_pass.dtype,
+                        device=expert_load_pass.device,
+                    )
+                    logical_expert_load.scatter_add_(
+                        1, physical_to_logical.long(), expert_load_pass
+                    )
+                    alignment_record = {
+                        "schema_version": 1,
+                        "model": eplb_model_state.model_name,
+                        "eplb_step": self.expert_rearrangement_step,
+                    }
+                    alignment_records.append(
+                        (
+                            alignment_record,
+                            logical_expert_load.to("cpu", non_blocking=True),
+                        )
+                    )
                 copied = torch.Event()
                 copied.record()
                 self._pending_balancedness.append(
@@ -671,6 +708,7 @@ class EplbState:
                         - self.expert_rearrangement_step,
                         copied,
                         stats,
+                        alignment_records,
                     )
                 )
 
@@ -727,7 +765,7 @@ class EplbState:
     def _maybe_log_balancedness(self) -> None:
         pending = self._pending_balancedness
         while pending:
-            step, steps_left, copied, stats = pending[0]
+            step, steps_left, copied, stats, alignment_records = pending[0]
             if not copied.query():
                 break
             pending.popleft()
@@ -744,6 +782,12 @@ class EplbState:
                     max_tokens,
                     balancedness,
                     steps_left,
+                )
+            for alignment_record, logical_expert_load in alignment_records:
+                alignment_record["logical_expert_counts"] = logical_expert_load.tolist()
+                logger.info(
+                    "VibeSimAlignmentExpertLoad %s",
+                    json.dumps(alignment_record, separators=(",", ":")),
                 )
 
     def _should_record_current_step(self, log_stats: bool = False) -> bool:
