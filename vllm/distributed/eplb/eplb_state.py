@@ -185,6 +185,8 @@ class EplbModelState:
     https://github.com/vllm-project/vllm/pull/22167#pullrequestreview-3086143856
     """
     model_name: str
+    experts_per_token: int
+    """Number of routed experts selected for each input token."""
     model: MixtureOfExperts
     expert_buffer: list[torch.Tensor]
     """
@@ -481,6 +483,11 @@ class EplbState:
         )
         self._propagate_shared_tensors(model, num_unpadded_tokens_tensors)
         expert_buffer = [torch.empty_like(w) for w in model.expert_weights[0]]
+        experts_per_token_values = {layer.top_k for layer in model.moe_layers}
+        assert len(experts_per_token_values) == 1, (
+            "all EPLB-managed MoE layers must use the same experts_per_token"
+        )
+        experts_per_token = experts_per_token_values.pop()
 
         assert self.parallel_config.eplb_config.communicator is not None, (
             "EPLB communicator backend must be set by ParallelConfig"
@@ -501,6 +508,7 @@ class EplbState:
             expert_load_pass_buffer=expert_load_pass_buffer,
             expert_load_window=expert_load_window,
             model_name=model_config.model,
+            experts_per_token=experts_per_token,
             model=model,
             expert_buffer=expert_buffer,
             rebalanced=False,
@@ -646,9 +654,11 @@ class EplbState:
                         1, physical_to_logical.long(), expert_load_pass
                     )
                     alignment_record = {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "model": eplb_model_state.model_name,
                         "eplb_step": self.expert_rearrangement_step,
+                        "expert_parallel_size": ep_group.size(),
+                        "experts_per_token": eplb_model_state.experts_per_token,
                         "logical_expert_counts": logical_expert_load.tolist(),
                     }
                     logger.info(
