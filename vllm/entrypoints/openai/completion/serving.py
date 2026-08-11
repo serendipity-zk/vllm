@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import io
 import itertools
 import json
 import time
@@ -38,7 +39,11 @@ from vllm.entrypoints.serve.engine.protocol import (
     PromptTokenUsageInfo,
     UsageInfo,
 )
-from vllm.entrypoints.serve.utils.api_utils import get_max_tokens, should_include_usage
+from vllm.entrypoints.serve.utils.api_utils import (
+    build_alignment_api_timing_record,
+    get_max_tokens,
+    should_include_usage,
+)
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.exceptions import GenerationError, VLLMValidationError
 from vllm.inputs import EngineInput
@@ -178,6 +183,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
         request: CompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | CompletionResponse | ErrorResponse:
+        api_request_start_monotonic = time.monotonic()
         if request.stream and request.use_beam_search:
             return self.create_error_response(
                 "Streaming is not currently supported with beam search"
@@ -266,6 +272,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
             generators.append(generator)
 
         result_generator = merge_async_iterators(*generators)
+        api_generators_ready_monotonic = time.monotonic()
 
         model_name = self.models.model_name(lora_request)
         num_prompts = len(engine_inputs)
@@ -284,6 +291,8 @@ class OpenAIServingCompletion(GenerateBaseServing):
                 num_prompts=num_prompts,
                 tokenizer=tokenizer,
                 request_metadata=request_metadata,
+                api_request_start_monotonic=api_request_start_monotonic,
+                api_generators_ready_monotonic=api_generators_ready_monotonic,
             )
 
         # Non-streaming response
@@ -351,6 +360,8 @@ class OpenAIServingCompletion(GenerateBaseServing):
         num_prompts: int,
         tokenizer: TokenizerLike | None,
         request_metadata: RequestResponseMetadata,
+        api_request_start_monotonic: float | None = None,
+        api_generators_ready_monotonic: float | None = None,
     ) -> AsyncGenerator[str, None]:
         num_choices = 1 if request.n is None else request.n
         next_text_offsets = [0] * num_choices * num_prompts
@@ -360,6 +371,13 @@ class OpenAIServingCompletion(GenerateBaseServing):
         num_prompt_tokens = [0] * num_prompts
         num_cached_tokens = None
         first_iteration = True
+        api_first_output_received_monotonic = None
+        api_last_output_received_monotonic = None
+        api_first_token_yield_monotonic = None
+        api_last_token_yield_monotonic = None
+        api_token_events = 0
+        api_first_token_event_tokens = 0
+        final_request_stats = None
 
         stream_options = request.stream_options
         include_usage, include_continuous_usage = should_include_usage(
@@ -384,6 +402,9 @@ class OpenAIServingCompletion(GenerateBaseServing):
 
             async for prompt_idx, res in result_generator:
                 last_res = res
+                output_received_monotonic = time.monotonic()
+                if res.metrics is not None:
+                    final_request_stats = res.metrics
                 prompt_token_ids = res.prompt_token_ids
                 prompt_logprobs = res.prompt_logprobs
 
@@ -496,11 +517,26 @@ class OpenAIServingCompletion(GenerateBaseServing):
 
                     if delta_template is not None and finish_reason is None:
                         prefix, infix, suffix = delta_template
-                        yield (
+                        frame = (
                             f"{prefix}{i}{infix}"
                             f"{json.dumps(delta_text, ensure_ascii=False)}"
                             f"{suffix}"
                         )
+                        if output.token_ids:
+                            if api_first_output_received_monotonic is None:
+                                api_first_output_received_monotonic = (
+                                    output_received_monotonic
+                                )
+                            api_last_output_received_monotonic = (
+                                output_received_monotonic
+                            )
+                            token_yield_monotonic = time.monotonic()
+                            if api_first_token_yield_monotonic is None:
+                                api_first_token_yield_monotonic = token_yield_monotonic
+                                api_first_token_event_tokens = len(output.token_ids)
+                            api_last_token_yield_monotonic = token_yield_monotonic
+                            api_token_events += 1
+                        yield frame
                         continue
 
                     chunk = CompletionStreamResponse(
@@ -552,6 +588,18 @@ class OpenAIServingCompletion(GenerateBaseServing):
                         )
 
                     response_json = chunk.model_dump_json(exclude_unset=True)
+                    if output.token_ids:
+                        if api_first_output_received_monotonic is None:
+                            api_first_output_received_monotonic = (
+                                output_received_monotonic
+                            )
+                        api_last_output_received_monotonic = output_received_monotonic
+                        token_yield_monotonic = time.monotonic()
+                        if api_first_token_yield_monotonic is None:
+                            api_first_token_yield_monotonic = token_yield_monotonic
+                            api_first_token_event_tokens = len(output.token_ids)
+                        api_last_token_yield_monotonic = token_yield_monotonic
+                        api_token_events += 1
                     yield f"data: {response_json}\n\n"
 
             if self.enable_log_outputs and self.request_logger:
@@ -623,6 +671,57 @@ class OpenAIServingCompletion(GenerateBaseServing):
             logger.exception("Error in completion stream generator.")
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
+        api_done_yield_monotonic = time.monotonic()
+        if (
+            final_request_stats is not None
+            and api_request_start_monotonic is not None
+            and api_generators_ready_monotonic is not None
+            and api_first_output_received_monotonic is not None
+            and api_last_output_received_monotonic is not None
+            and api_first_token_yield_monotonic is not None
+            and api_last_token_yield_monotonic is not None
+            and final_request_stats.queued_ts > 0.0
+            and final_request_stats.first_token_ts > 0.0
+            and final_request_stats.last_token_ts > 0.0
+            and final_request_stats.api_generate_start_ts > 0.0
+            and final_request_stats.api_add_request_done_ts > 0.0
+            and final_request_stats.api_first_engine_output_received_ts > 0.0
+            and final_request_stats.api_first_output_collector_put_ts > 0.0
+            and final_request_stats.api_first_output_dequeued_ts > 0.0
+        ):
+            timing_record = build_alignment_api_timing_record(
+                request_id=request_id,
+                request_start_monotonic=api_request_start_monotonic,
+                generators_ready_monotonic=api_generators_ready_monotonic,
+                first_output_received_monotonic=api_first_output_received_monotonic,
+                last_output_received_monotonic=api_last_output_received_monotonic,
+                first_token_yield_monotonic=api_first_token_yield_monotonic,
+                last_token_yield_monotonic=api_last_token_yield_monotonic,
+                done_yield_monotonic=api_done_yield_monotonic,
+                engine_queued_monotonic=final_request_stats.queued_ts,
+                engine_first_token_monotonic=final_request_stats.first_token_ts,
+                engine_last_token_monotonic=final_request_stats.last_token_ts,
+                generate_start_monotonic=final_request_stats.api_generate_start_ts,
+                add_request_done_monotonic=(
+                    final_request_stats.api_add_request_done_ts
+                ),
+                first_engine_output_received_monotonic=(
+                    final_request_stats.api_first_engine_output_received_ts
+                ),
+                first_output_collector_put_monotonic=(
+                    final_request_stats.api_first_output_collector_put_ts
+                ),
+                first_output_dequeued_monotonic=(
+                    final_request_stats.api_first_output_dequeued_ts
+                ),
+                output_tokens=sum(previous_num_tokens),
+                token_events=api_token_events,
+                first_token_event_tokens=api_first_token_event_tokens,
+            )
+            logger.info(
+                "VibeSimAlignmentApiRequestTiming %s",
+                json.dumps(timing_record, separators=(",", ":")),
+            )
         yield "data: [DONE]\n\n"
 
     def request_output_to_completion_response(

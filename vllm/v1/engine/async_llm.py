@@ -782,6 +782,7 @@ class AsyncLLM(EngineClient):
             >>> gen = self.generate(engine_input, sampling_params, request_id)
 
         """
+        api_generate_start_monotonic = time.monotonic()
         q: RequestOutputCollector | None = None
         try:
             q = await self.add_request(
@@ -799,6 +800,7 @@ class AsyncLLM(EngineClient):
                 reasoning_ended=reasoning_ended,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
             )
+            api_add_request_done_monotonic = time.monotonic()
 
             # The output_handler task pushes items into the queue.
             # This task pulls from the queue and yields to caller.
@@ -811,6 +813,14 @@ class AsyncLLM(EngineClient):
                 # Note: both OutputProcessor and EngineCore handle their
                 # own request cleanup based on finished.
                 assert isinstance(out, RequestOutput)
+                if (
+                    out.metrics is not None
+                    and out.metrics.api_first_output_dequeued_ts == 0.0
+                    and any(completion.token_ids for completion in out.outputs)
+                ):
+                    out.metrics.api_generate_start_ts = api_generate_start_monotonic
+                    out.metrics.api_add_request_done_ts = api_add_request_done_monotonic
+                    out.metrics.api_first_output_dequeued_ts = time.monotonic()
                 finished = out.finished
                 if out is not STREAM_FINISHED:
                     yield out
@@ -892,6 +902,7 @@ class AsyncLLM(EngineClient):
                 while True:
                     # 1) Pull EngineCoreOutputs from the EngineCore.
                     outputs = await engine_core.get_output_async()
+                    api_engine_output_received_timestamp = time.monotonic()
                     num_outputs = len(outputs.outputs)
 
                     iteration_stats = (
@@ -921,6 +932,9 @@ class AsyncLLM(EngineClient):
                             outputs.timestamp,
                             iteration_stats,
                             weight_version=outputs.weight_version,
+                            api_engine_output_received_timestamp=(
+                                api_engine_output_received_timestamp
+                            ),
                         )
                         # NOTE: RequestOutputs are pushed to their queues.
                         assert not processed_outputs.request_outputs
