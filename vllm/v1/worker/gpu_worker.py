@@ -93,6 +93,7 @@ from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
 )
+from vllm.v1.worker.alignment_trace import is_routing_trace_enabled
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -793,6 +794,12 @@ class Worker(WorkerBase):
                 tag="kv_cache"
             ),
         )
+
+        # Upstream moved routed-experts capture into the V2-only AuxOutput
+        # connector. The alignment routing dump still reads raw topk_ids, so
+        # its env var alone brings up a private capturer on model runner V1.
+        if not self.use_v2_model_runner and is_routing_trace_enabled():
+            self.model_runner.init_alignment_routing_capturer()
 
         # Build KV-zero metadata outside the CuMem pool so the bookkeeping
         # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch

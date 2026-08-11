@@ -61,6 +61,10 @@ from vllm.lora.layers import BaseLayerWithLoRA, LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    RoutedExpertsCapturer,
+    bind_routed_experts_capturer,
+)
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
@@ -203,6 +207,16 @@ from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.block_table import SlotMappingMode
+from vllm.v1.worker.alignment_trace import (
+    dump_routing_summary as dump_alignment_routing_summary,
+)
+from vllm.v1.worker.alignment_trace import (
+    dump_token_inputs as dump_alignment_token_inputs,
+)
+from vllm.v1.worker.alignment_trace import (
+    should_trace_routing_iteration,
+    should_trace_token_iteration,
+)
 from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
     get_dcp_dummy_context_len,
@@ -520,6 +534,9 @@ class GPUModelRunner(
         # These will be overridden in load_model()
         self.is_multimodal_pruning_enabled = False
         self.requires_sequential_video_encoding = False
+        # Set by init_alignment_routing_capturer() when the alignment routing
+        # dump is enabled; upstream V1 no longer captures routed experts.
+        self.alignment_routing_capturer: RoutedExpertsCapturer | None = None
         self.max_model_len = model_config.max_model_len
 
         # Always set to false after the first forward pass
@@ -4387,6 +4404,19 @@ class GPUModelRunner(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
 
+            if should_trace_token_iteration(iteration_index):
+                # Unpadded count and the pre-padding request order: the dump
+                # splits the flat buffer back into per-request spans, so the
+                # padding tail would be attributed to the last request.
+                dump_alignment_token_inputs(
+                    iteration_index=iteration_index,
+                    input_ids=input_ids,
+                    req_ids=list(req_ids),
+                    num_scheduled_tokens=num_scheduled_tokens_np,
+                    num_tokens=num_tokens_unpadded,
+                    positions=self.positions,
+                )
+
         # Encoder-decoder models can only compile the pure decode steps where no
         # encoder inputs are present. Use eager for the first pass.
         num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
@@ -4433,6 +4463,24 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+            if should_trace_routing_iteration(iteration_index):
+                if self.alignment_routing_capturer is not None:
+                    # Read the capture buffer here, before the next iteration's
+                    # forward overwrites it.
+                    dump_alignment_routing_summary(
+                        capturer=self.alignment_routing_capturer,
+                        static_forward_context=(
+                            self.compilation_config.static_forward_context
+                        ),
+                        iteration_index=iteration_index,
+                        num_tokens=num_scheduled_tokens,
+                    )
+                else:
+                    logger.error(
+                        "Alignment routing trace is on but the alignment "
+                        "routed-experts capturer was never initialized."
+                    )
 
         with record_function_or_nullcontext(f"{iteration_prefix}: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -7398,6 +7446,20 @@ class GPUModelRunner(
             kv_transfer_group = get_kv_transfer_group()
             kv_transfer_group.register_kv_caches(kv_caches)
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
+
+    def init_alignment_routing_capturer(self) -> None:
+        """Bind a private capturer for VLLM_VIBESIM_ROUTING_TRACE_* dumps.
+
+        Upstream serves ``--enable-return-routed-experts`` through the V2-only
+        AuxOutput connector. This capturer only feeds the alignment routing
+        summary; it returns nothing on responses.
+        """
+        capturer = RoutedExpertsCapturer(
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            vllm_config=self.vllm_config,
+        )
+        bind_routed_experts_capturer(self.model, capturer)
+        self.alignment_routing_capturer = capturer
 
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
         """Add encoder-only layers to the KV cache config."""
