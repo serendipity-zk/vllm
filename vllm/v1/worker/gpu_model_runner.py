@@ -194,6 +194,16 @@ from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_chang
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
+from vllm.v1.worker.alignment_trace import (
+    dump_routing_summary as dump_alignment_routing_summary,
+)
+from vllm.v1.worker.alignment_trace import (
+    dump_token_inputs as dump_alignment_token_inputs,
+)
+from vllm.v1.worker.alignment_trace import (
+    should_trace_routing_iteration,
+    should_trace_token_iteration,
+)
 from vllm.v1.worker.cp_utils import (
     check_attention_cp_compatibility,
     get_total_cp_world_size,
@@ -4242,6 +4252,19 @@ class GPUModelRunner(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
 
+            if should_trace_token_iteration(iteration_index):
+                # Unpadded count and the pre-padding request order: the dump
+                # splits the flat buffer back into per-request spans, so the
+                # padding tail would be attributed to the last request.
+                dump_alignment_token_inputs(
+                    iteration_index=iteration_index,
+                    input_ids=input_ids,
+                    req_ids=list(req_ids),
+                    num_scheduled_tokens=num_scheduled_tokens_np,
+                    num_tokens=num_tokens_unpadded,
+                    positions=self.positions,
+                )
+
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
         # with CUDA graph capture.
@@ -4287,6 +4310,25 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+            if should_trace_routing_iteration(iteration_index):
+                if self.routed_experts_initialized:
+                    # Read the capture buffer here, before the next iteration's
+                    # forward overwrites it.
+                    dump_alignment_routing_summary(
+                        capturer=self.routed_experts_capturer,
+                        static_forward_context=(
+                            self.compilation_config.static_forward_context
+                        ),
+                        iteration_index=iteration_index,
+                        num_tokens=num_scheduled_tokens,
+                    )
+                else:
+                    logger.error(
+                        "Alignment routing trace is on but the routed-experts "
+                        "capturer was never initialized; start the server with "
+                        "--enable-return-routed-experts."
+                    )
 
         with record_function_or_nullcontext(f"{iteration_prefix}: postprocess"):
             if self.use_aux_hidden_state_outputs:

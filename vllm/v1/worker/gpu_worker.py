@@ -67,6 +67,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.worker.alignment_trace import is_routing_trace_enabled
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -577,7 +578,13 @@ class Worker(WorkerBase):
         with self._maybe_get_memory_pool_context(tag="kv_cache"):
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
-        if self.model_config.enable_return_routed_experts:
+        # The alignment routing dump reads the same capture buffer, so let its
+        # env var turn the capturer on rather than requiring the operator to
+        # remember a second, unrelated-looking server flag.
+        if (
+            self.model_config.enable_return_routed_experts
+            or is_routing_trace_enabled()
+        ):
             self.model_runner.init_routed_experts_capturer()
 
         # Build KV-zero metadata outside the CuMem pool so the bookkeeping
