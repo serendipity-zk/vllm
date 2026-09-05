@@ -24,6 +24,7 @@ import json
 import math
 import os
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -367,3 +368,12 @@ def dump_routing_summary(
             ]
 
         _append_jsonl(trace_path, row)
+
+
+def alignment_phase(iteration_index: int | None, phase: str):
+    """Use indexed scopes for real dispatches only; warmup has no iteration."""
+    if iteration_index is None:
+        return nullcontext()
+    from vllm.v1.utils import record_function_or_nullcontext
+
+    return record_function_or_nullcontext(f"vllm_iteration({iteration_index}): {phase}")
