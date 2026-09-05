@@ -135,6 +135,11 @@ class AuxOutputWorkerConnector:
             vllm_config.max_concurrent_batches,
         )
 
+    @property
+    def routed_experts_capturer(self) -> RoutedExpertsCapturer:
+        """The bound capturer; alignment dumps read its raw device buffer."""
+        return self._capturer
+
     def prepare_output(self, input_batch: InputBatch) -> PendingAuxOutput | None:
         """Snapshot one step's R3 tensor for asynchronous CPU transfer."""
         if self._buffer is None or self._step_metadata is None:
