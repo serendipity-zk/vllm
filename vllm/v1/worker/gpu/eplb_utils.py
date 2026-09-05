@@ -17,6 +17,7 @@ from vllm.model_executor.models.interfaces import (
     get_mixture_of_experts_model,
 )
 from vllm.models.deepseek_v4.common.eplb_util import dspark_draft_supports_eplb
+from vllm.v1.worker.alignment_trace import alignment_phase
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -56,7 +57,11 @@ def step_eplb_after(*, is_dummy: bool = False) -> Callable:
 
             result = fn(self, *args, **kwargs)
             is_profile = kwargs.get("is_profile", False) if is_dummy else False
-            self.eplb.step(is_dummy=is_dummy, is_profile=is_profile)
+            iteration_index = (
+                None if is_dummy else getattr(self, "_alignment_iteration_index", None)
+            )
+            with alignment_phase(iteration_index, "eplb"):
+                self.eplb.step(is_dummy=is_dummy, is_profile=is_profile)
             return result
 
         return wrapper
