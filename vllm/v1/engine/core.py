@@ -69,6 +69,7 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1.engine.alignment import iteration_request_details
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -402,12 +403,13 @@ class EngineCore:
 
     @contextmanager
     def log_iteration_details(self, scheduler_output: SchedulerOutput | None):
+        observation: dict[str, ModelRunnerOutput] = {}
         if not self.vllm_config.observability_config.enable_logging_iteration_details:
-            yield
+            yield observation
             return
         # 0-token step: let the dummy_batch wrapper log it (avoids double-log).
         if scheduler_output and scheduler_output.total_num_scheduled_tokens == 0:
-            yield
+            yield observation
             return
         # scheduler_output=None marks a DP dummy iteration.
         if scheduler_output is None:
@@ -426,7 +428,7 @@ class EngineCore:
         # start-to-end duration retains the historical "iteration elapsed"
         # observation around result wait + sampling.
         observed_start_monotonic_ns = time.monotonic_ns()
-        yield
+        yield observation
         observed_end_monotonic_ns = time.monotonic_ns()
         observed_elapsed_ms = (
             observed_end_monotonic_ns - observed_start_monotonic_ns
@@ -452,36 +454,8 @@ class EngineCore:
             )
         )
         if scheduler_output is not None:
-            cached_requests = scheduler_output.scheduled_cached_reqs
-            prefill_chunk_pairs = []
-            for new_request in scheduler_output.scheduled_new_reqs:
-                appended_tokens = scheduler_output.num_scheduled_tokens.get(
-                    new_request.req_id, 0
-                )
-                if appended_tokens > 0:
-                    prefill_chunk_pairs.append(
-                        [new_request.num_computed_tokens, appended_tokens]
-                    )
-            for request_index, request_id in enumerate(cached_requests.req_ids):
-                if cached_requests.is_context_phase(request_id):
-                    appended_tokens = scheduler_output.num_scheduled_tokens.get(
-                        request_id, 0
-                    )
-                    if appended_tokens > 0:
-                        prefill_chunk_pairs.append(
-                            [
-                                cached_requests.num_computed_tokens[request_index],
-                                appended_tokens,
-                            ]
-                        )
-            decode_kv_lens = [
-                cached_requests.num_computed_tokens[request_index]
-                for request_index, request_id in enumerate(cached_requests.req_ids)
-                if not cached_requests.is_context_phase(request_id)
-                and scheduler_output.num_scheduled_tokens.get(request_id, 0) > 0
-            ]
             alignment_record = {
-                "schema_version": 2,
+                "schema_version": 4,
                 "input_adapter": "vllm_text",
                 "iteration_index": iteration_index,
                 "observed_start_monotonic_ns": observed_start_monotonic_ns,
@@ -490,8 +464,14 @@ class EngineCore:
                 "prefill_tokens": iteration_details.num_ctx_tokens,
                 "decode_requests": iteration_details.num_generation_requests,
                 "decode_tokens_scheduled": iteration_details.num_generation_tokens,
-                "prefill_chunk_pairs": prefill_chunk_pairs,
-                "decode_kv_lens": decode_kv_lens,
+                **iteration_request_details(
+                    scheduler_output,
+                    observation.get("model_output"),
+                    requests=self.scheduler.requests,
+                    request_ids_randomized=(
+                        not envs.VLLM_DISABLE_REQUEST_ID_RANDOMIZATION
+                    ),
+                ),
             }
             logger.info(
                 "VibeSimAlignmentIteration %s",
@@ -523,11 +503,12 @@ class EngineCore:
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.log_error_detail(scheduler_output),
-            self.log_iteration_details(scheduler_output),
+            self.log_iteration_details(scheduler_output) as observation,
         ):
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+            observation["model_output"] = model_output
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -623,7 +604,7 @@ class EngineCore:
         future, scheduler_output, exec_model_fut = batch_queue.pop()
         with (
             self.log_error_detail(scheduler_output),
-            self.log_iteration_details(scheduler_output),
+            self.log_iteration_details(scheduler_output) as observation,
         ):
             model_output = future.result()
             if model_output is None:
@@ -631,6 +612,7 @@ class EngineCore:
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
+            observation["model_output"] = model_output
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
