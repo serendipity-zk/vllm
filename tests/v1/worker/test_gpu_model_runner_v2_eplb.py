@@ -29,14 +29,23 @@ class FakeEplbState:
         self.parallel_config = parallel_config
         self.device = device
         self.add_model_calls: list[tuple[Any, Any]] = []
+        self.model_roles: list[tuple[str, int]] = []
         self.step_calls: list[tuple[bool, bool, bool]] = []
         self.async_started = False
         self.is_async = True
         self.built_from_mapping = False
         FakeEplbState.instances.append(self)
 
-    def add_model(self, model: Any, model_config: Any) -> None:
+    def add_model(
+        self,
+        model: Any,
+        model_config: Any,
+        *,
+        model_role: str = "target",
+        max_forwards_per_step: int = 1,
+    ) -> None:
         self.add_model_calls.append((model, model_config))
+        self.model_roles.append((model_role, max_forwards_per_step))
 
     def step(self, is_dummy: bool, is_profile: bool, *, log_stats: bool) -> None:
         self.step_calls.append((is_dummy, is_profile, log_stats))
@@ -118,6 +127,26 @@ def test_v2_load_model_registers_moe_with_eplb(monkeypatch):
     assert runner.eplb_state is not None
     assert runner.eplb_state.add_model_calls == [(model, runner.model_config)]
     assert runner.eplb_state.async_started is True
+
+
+def test_eplb_keeps_target_and_spec5_draft_roles_distinct(monkeypatch):
+    monkeypatch.setattr(eplb, "EplbState", FakeEplbState)
+    monkeypatch.setattr(eplb, "is_mixture_of_experts", lambda *_: True)
+    runner = _make_runner()
+    runner.eplb.prepare_load()
+    target, draft = object(), object()
+    draft_config = SimpleNamespace(model="draft-model")
+    assert runner.eplb.maybe_register_model(target, runner.model_config, False)
+    assert runner.eplb.maybe_register_speculator(
+        SimpleNamespace(model=draft),
+        SimpleNamespace(draft_model_config=draft_config, num_speculative_tokens=5),
+        False,
+    )
+    assert runner.eplb.state.add_model_calls == [
+        (target, runner.model_config),
+        (draft, draft_config),
+    ]
+    assert runner.eplb.state.model_roles == [("target", 1), ("draft", 5)]
 
 
 def test_v2_load_model_with_dummy_weights_skips_eplb_registration(monkeypatch):

@@ -89,6 +89,8 @@ class EPLBController:
         self.state.add_model(
             draft_model,
             speculative_config.draft_model_config,
+            model_role="draft",
+            max_forwards_per_step=speculative_config.num_speculative_tokens,
         )
         self._has_registered_models = True
         return True

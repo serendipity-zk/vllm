@@ -5185,6 +5185,8 @@ class GPUModelRunner(
                         self.eplb_state.add_model(
                             self.drafter.model,
                             spec_config.draft_model_config,
+                            model_role="draft",
+                            max_forwards_per_step=spec_config.num_speculative_tokens,
                         )
                         eplb_models += 1
 
