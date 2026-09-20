@@ -190,6 +190,9 @@ class AsyncLLM(EngineClient):
         except RuntimeError:
             pass
 
+        # Always bind the attribute: start_profile/stop_profile read it on every
+        # profiler backend, but only the torch frontend profiler constructs one.
+        self.profiler = profiler
         if (
             vllm_config.profiler_config.profiler == "torch"
             and not vllm_config.profiler_config.ignore_frontend
