@@ -9,6 +9,7 @@ from torch.nn import Module
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.config import get_current_vllm_config
 from vllm.config.kernel import MoEBackend
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
@@ -84,6 +85,16 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
         _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.XPU]
     elif current_platform.is_cpu():
         _AVAILABLE_BACKENDS = [UnquantizedMoeBackend.CPU]
+
+    # A monolithic kernel routes from the logits itself, so `MoERunner` never
+    # calls `select_experts` and the router's capture hook is never reached.
+    # Demote those while routed experts are being captured: the modular kernel
+    # produces the same routing -- same router, same logits, a different GEMM.
+    vllm_config = get_current_vllm_config()
+    if vllm_config is not None and vllm_config.model_config.enable_return_routed_experts:
+        for backend in list(_AVAILABLE_BACKENDS):
+            if issubclass(backend_to_kernel_cls(backend), mk.FusedMoEExpertsMonolithic):
+                _move_to_back(_AVAILABLE_BACKENDS, backend)
     return _AVAILABLE_BACKENDS
 
 
