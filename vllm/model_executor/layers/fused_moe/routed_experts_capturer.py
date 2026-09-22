@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import TypeVar
 
 import numpy as np
@@ -21,6 +21,25 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+B = TypeVar("B")
+
+
+def _capturing_routes() -> bool:
+    from vllm.config import get_current_vllm_config
+
+    vllm_config = get_current_vllm_config()
+    return (
+        vllm_config is not None
+        and vllm_config.model_config.enable_return_routed_experts
+    )
+
+
+def _is_monolithic(kernel: type) -> bool:
+    from vllm.model_executor.layers.fused_moe.modular_kernel import (
+        FusedMoEExpertsMonolithic,
+    )
+
+    return issubclass(kernel, FusedMoEExpertsMonolithic)
 
 
 def order_for_route_capture(
@@ -38,20 +57,34 @@ def order_for_route_capture(
     ``candidates`` are kernel classes, or anything ``kernel_of`` maps to one,
     such as an oracle's backend enum.
     """
-    from vllm.config import get_current_vllm_config
-    from vllm.model_executor.layers.fused_moe.modular_kernel import (
-        FusedMoEExpertsMonolithic,
-    )
-
-    vllm_config = get_current_vllm_config()
-    if vllm_config is None or not vllm_config.model_config.enable_return_routed_experts:
+    if not _capturing_routes():
         return candidates
     return sorted(
-        candidates,
-        key=lambda candidate: issubclass(
-            kernel_of(candidate), FusedMoEExpertsMonolithic
-        ),
+        candidates, key=lambda candidate: _is_monolithic(kernel_of(candidate))
     )
+
+
+def route_capture_kernels(
+    backends: list[B], backend_to_kernel_cls: Callable[[B], list[type]]
+) -> Iterator[tuple[B, type]]:
+    """Every ``(backend, kernel)`` pair an automatic selection tries, in order.
+
+    While capturing, a modular kernel of a later backend is tried before a
+    monolithic kernel of an earlier one -- otherwise a backend whose modular
+    kernel does not support the configuration returns its monolithic one, which
+    the capturer refuses, and the later modular kernel that would have worked
+    is never reached. Lazy either way: a backend's kernels are looked up only
+    once every earlier candidate has been tried, as the selection loops expect.
+    """
+    capturing = _capturing_routes()
+    deferred: list[tuple[B, type]] = []
+    for backend in backends:
+        for kernel in backend_to_kernel_cls(backend):
+            if capturing and _is_monolithic(kernel):
+                deferred.append((backend, kernel))
+            else:
+                yield backend, kernel
+    yield from deferred
 
 
 def _get_num_experts_per_tok(hf_config) -> int:

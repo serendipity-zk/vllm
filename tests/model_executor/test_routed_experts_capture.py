@@ -315,3 +315,48 @@ def test_a_capture_prefers_the_kernel_that_calls_the_router(capturing):
     assert ordered == ([Modular, Fused] if capturing else [Fused, Modular])
     assert alone == [Fused], "a backend with no modular kernel is left to refuse"
     assert backends == (["cutlass", "trtllm"] if capturing else ["trtllm", "cutlass"])
+
+
+@pytest.mark.parametrize("capturing", [False, True])
+def test_a_later_backends_modular_kernel_beats_an_earlier_monolithic_one(capturing):
+    """A backend whose modular kernel is unsupported must not end the search."""
+    import vllm.config as vllm_config_module
+    from vllm.model_executor.layers.fused_moe.modular_kernel import (
+        FusedMoEExpertsMonolithic,
+    )
+    from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+        route_capture_kernels,
+    )
+
+    class Fused(FusedMoEExpertsMonolithic):
+        pass
+
+    class TrtModular:
+        pass
+
+    class CutlassModular:
+        pass
+
+    looked_up = []
+
+    def kernels_of(backend):
+        looked_up.append(backend)
+        return {"trtllm": [Fused, TrtModular], "cutlass": [CutlassModular]}[backend]
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(enable_return_routed_experts=capturing)
+    )
+    with patch.object(
+        vllm_config_module, "get_current_vllm_config", return_value=config
+    ):
+        tried = list(route_capture_kernels(["trtllm", "cutlass"], kernels_of))
+        looked_up.clear()
+        first = next(iter(route_capture_kernels(["trtllm", "cutlass"], kernels_of)))
+
+    if capturing:
+        assert [kernel for _, kernel in tried] == [TrtModular, CutlassModular, Fused]
+    else:
+        assert [kernel for _, kernel in tried] == [Fused, TrtModular, CutlassModular]
+    # Selection stops at the first supported pair; later backends stay unread.
+    assert looked_up == ["trtllm"]
+    assert first[0] == "trtllm"

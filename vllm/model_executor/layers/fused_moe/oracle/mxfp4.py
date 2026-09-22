@@ -28,6 +28,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     order_for_route_capture,
+    route_capture_kernels,
 )
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import _swizzle_mxfp4
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -539,22 +540,23 @@ def select_mxfp4_moe_backend(
             activation_format,
         )
 
-    for backend in AVAILABLE_BACKENDS:
+    for backend, k_cls in route_capture_kernels(
+        AVAILABLE_BACKENDS, backend_to_kernel_cls
+    ):
         # Use requested_activation_key if provided, otherwise use backend default
         act_key = (
             requested_activation_key
             if requested_activation_key is not None
             else _backend_activation_key(backend)
         )
-        for k_cls in backend_to_kernel_cls(backend):
-            supported, reason = k_cls.is_supported_config(
-                k_cls, config, kMxfp4Static, act_key, activation_format
-            )
-            if supported:
-                logger.info_once(_make_log_backend(backend))
-                return backend, k_cls
-            else:
-                logger.debug_once(_make_log_unsupported(backend, reason))
+        supported, reason = k_cls.is_supported_config(
+            k_cls, config, kMxfp4Static, act_key, activation_format
+        )
+        if supported:
+            logger.info_once(_make_log_backend(backend))
+            return backend, k_cls
+        else:
+            logger.debug_once(_make_log_unsupported(backend, reason))
 
     if current_platform.is_xpu():
         backend = Mxfp4MoeBackend.XPU

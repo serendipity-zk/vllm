@@ -20,6 +20,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     order_for_route_capture,
+    route_capture_kernels,
 )
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     FlashinferMoeBackend,
@@ -337,24 +338,26 @@ def select_fp8_moe_backend(
             )
         else:
             # If the user is not explicit about the backend, try both.
-            for backend in [
+            fi_backends = [
                 Fp8MoeBackend.FLASHINFER_TRTLLM,
                 Fp8MoeBackend.FLASHINFER_CUTLASS,
-            ]:
-                for k_cls in backend_to_kernel_cls(backend):
-                    supported, reason = k_cls.is_supported_config(
-                        k_cls,
-                        config,
-                        weight_key,
-                        activation_key,
-                        activation_format,
-                    )
+            ]
+            for backend, k_cls in route_capture_kernels(
+                fi_backends, backend_to_kernel_cls
+            ):
+                supported, reason = k_cls.is_supported_config(
+                    k_cls,
+                    config,
+                    weight_key,
+                    activation_key,
+                    activation_format,
+                )
 
-                    if supported:
-                        logger.info_once(_make_log_backend(backend))
-                        return backend, k_cls
-                    else:
-                        logger.debug_once(_make_log_unsupported(backend, reason))
+                if supported:
+                    logger.info_once(_make_log_backend(backend))
+                    return backend, k_cls
+                else:
+                    logger.debug_once(_make_log_unsupported(backend, reason))
 
             raise NotImplementedError(
                 "Found VLLM_USE_FLASHINFER_MOE_FP8=1, but no "
@@ -398,20 +401,21 @@ def select_fp8_moe_backend(
         AVAILABLE_BACKENDS.remove(Fp8MoeBackend.BATCHED_VLLM_CUTLASS)
 
     # Select kernels in order of backend.
-    for backend in AVAILABLE_BACKENDS:
-        for k_cls in backend_to_kernel_cls(backend):
-            supported, reason = k_cls.is_supported_config(
-                k_cls,
-                config,
-                weight_key,
-                activation_key,
-                activation_format,
-            )
-            if supported:
-                logger.info_once(_make_log_backend(backend))
-                return backend, k_cls
-            else:
-                logger.debug_once(_make_log_unsupported(backend, reason))
+    for backend, k_cls in route_capture_kernels(
+        AVAILABLE_BACKENDS, backend_to_kernel_cls
+    ):
+        supported, reason = k_cls.is_supported_config(
+            k_cls,
+            config,
+            weight_key,
+            activation_key,
+            activation_format,
+        )
+        if supported:
+            logger.info_once(_make_log_backend(backend))
+            return backend, k_cls
+        else:
+            logger.debug_once(_make_log_unsupported(backend, reason))
 
     # TODO(rob): per discussion with TPU team, we need a way to register
     # MoE backends by OOT plugins, rather than having an explicit list

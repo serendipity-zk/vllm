@@ -19,6 +19,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     order_for_route_capture,
+    route_capture_kernels,
 )
 from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
     prepare_nvfp4_moe_layer_for_fi_or_cutlass,
@@ -291,20 +292,21 @@ def select_nvfp4_moe_backend(
                 for b in FLASHINFER_NVFP4_MOE_BACKENDS
                 if config.swiglu_limit is None or b in NVFP4_BACKENDS_WITH_CLAMP
             ]
-            for backend in fi_backends:
-                for k_cls in backend_to_kernel_cls(backend):
-                    supported, reason = k_cls.is_supported_config(
-                        k_cls,
-                        config,
-                        weight_key,
-                        activation_key,
-                        activation_format,
-                    )
-                    if supported:
-                        logger.info_once(_make_log_backend(backend))
-                        return backend, k_cls
-                    else:
-                        logger.debug_once(_make_log_unsupported(backend, reason))
+            for backend, k_cls in route_capture_kernels(
+                fi_backends, backend_to_kernel_cls
+            ):
+                supported, reason = k_cls.is_supported_config(
+                    k_cls,
+                    config,
+                    weight_key,
+                    activation_key,
+                    activation_format,
+                )
+                if supported:
+                    logger.info_once(_make_log_backend(backend))
+                    return backend, k_cls
+                else:
+                    logger.debug_once(_make_log_unsupported(backend, reason))
 
             raise NotImplementedError(
                 "Found VLLM_USE_FLASHINFER_MOE_FP4=1, but no "
@@ -318,20 +320,21 @@ def select_nvfp4_moe_backend(
         )
 
     # Select kernels in order of backend.
-    for backend in AVAILABLE_BACKENDS:
-        for k_cls in backend_to_kernel_cls(backend):
-            supported, reason = k_cls.is_supported_config(
-                k_cls,
-                config,
-                weight_key,
-                activation_key,
-                activation_format,
-            )
-            if supported:
-                logger.info_once(_make_log_backend(backend))
-                return backend, k_cls
-            else:
-                logger.debug_once(_make_log_unsupported(backend, reason))
+    for backend, k_cls in route_capture_kernels(
+        AVAILABLE_BACKENDS, backend_to_kernel_cls
+    ):
+        supported, reason = k_cls.is_supported_config(
+            k_cls,
+            config,
+            weight_key,
+            activation_key,
+            activation_format,
+        )
+        if supported:
+            logger.info_once(_make_log_backend(backend))
+            return backend, k_cls
+        else:
+            logger.debug_once(_make_log_unsupported(backend, reason))
 
     raise NotImplementedError(
         "No NvFp4 MoE backend supports the deployment configuration."
