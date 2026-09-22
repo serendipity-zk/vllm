@@ -134,7 +134,11 @@ def num_capture_layers(vllm_config: VllmConfig) -> int:
     """
     hf_config = vllm_config.model_config.hf_text_config
     num_layers = hf_config.num_hidden_layers
-    if vllm_config.speculative_config is not None:
+    # Only an MTP drafter runs those layers; vLLM normalizes every MTP model
+    # type to this method. An n-gram or EAGLE drafter leaves them unrun, and a
+    # slot nothing writes would read downstream as a skipped draft step.
+    spec_config = vllm_config.speculative_config
+    if spec_config is not None and spec_config.method == "mtp":
         num_layers += getattr(hf_config, "num_nextn_predict_layers", 0) or 0
     return num_layers
 

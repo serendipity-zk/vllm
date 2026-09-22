@@ -360,3 +360,30 @@ def test_a_later_backends_modular_kernel_beats_an_earlier_monolithic_one(capturi
     # Selection stops at the first supported pair; later backends stay unread.
     assert looked_up == ["trtllm"]
     assert first[0] == "trtllm"
+
+
+@pytest.mark.parametrize(
+    ("speculative_config", "slots"),
+    [
+        (None, 78),
+        (SimpleNamespace(method="mtp"), 79),
+        (SimpleNamespace(method="ngram"), 78),
+        (SimpleNamespace(method="eagle"), 78),
+    ],
+    ids=["no_drafter", "mtp", "ngram", "eagle"],
+)
+def test_only_an_mtp_drafter_gets_capture_slots(speculative_config, slots):
+    """A slot nothing writes would read downstream as a skipped draft step."""
+    from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+        num_capture_layers,
+    )
+
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                num_hidden_layers=78, num_nextn_predict_layers=1
+            )
+        ),
+        speculative_config=speculative_config,
+    )
+    assert num_capture_layers(vllm_config) == slots
