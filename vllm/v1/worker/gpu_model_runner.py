@@ -7409,6 +7409,16 @@ class GPUModelRunner(
             "Initializing routed experts capturer, enable_return_routed_experts: %s",
             self.model_config.enable_return_routed_experts,
         )
+        spec_config = self.speculative_config
+        if spec_config is not None and spec_config.disable_padded_drafter_batch:
+            # The unpadded drafter runs after `_bookkeeping_sync` has already
+            # copied the capture buffer out, so its slots would reach the
+            # client as zeros that nothing downstream can tell from a route.
+            raise ValueError(
+                "routed-experts capture records the drafter only with the padded "
+                "drafter batch; drop disable_padded_drafter_batch from "
+                "--speculative-config"
+            )
         self.routed_experts_capturer = RoutedExpertsCapturer(
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             vllm_config=self.vllm_config,

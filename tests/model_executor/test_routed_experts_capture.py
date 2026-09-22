@@ -268,3 +268,15 @@ def test_later_draft_passes_cannot_overwrite_the_first_passs_routes():
 
     assert torch.equal(capturer.device_buffer[:6, 2, :], first_pass)
     assert torch.equal(capturer.device_buffer[:6, 0, :], target)
+
+
+def test_an_unpadded_drafter_is_refused_rather_than_captured_as_zeros():
+    """Its passes run after the step's capture buffer was copied out."""
+    import vllm.v1.worker.gpu_model_runner as gmr
+
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(enable_return_routed_experts=True),
+        speculative_config=SimpleNamespace(disable_padded_drafter_batch=True),
+    )
+    with pytest.raises(ValueError, match="padded drafter batch"):
+        gmr.GPUModelRunner.init_routed_experts_capturer(runner)
