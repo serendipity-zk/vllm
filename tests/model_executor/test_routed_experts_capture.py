@@ -307,6 +307,11 @@ def test_a_capture_prefers_the_kernel_that_calls_the_router(capturing):
     ):
         ordered = order_for_route_capture([Fused, Modular])
         alone = order_for_route_capture([Fused])
+        # An oracle ranks backends, and each names the kernel it would build.
+        backends = order_for_route_capture(
+            ["trtllm", "cutlass"], {"trtllm": Fused, "cutlass": Modular}.__getitem__
+        )
 
     assert ordered == ([Modular, Fused] if capturing else [Fused, Modular])
     assert alone == [Fused], "a backend with no modular kernel is left to refuse"
+    assert backends == (["cutlass", "trtllm"] if capturing else ["trtllm", "cutlass"])

@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from typing import TypeVar
 
 import numpy as np
 import torch
@@ -18,8 +20,12 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 
 logger = logging.getLogger(__name__)
 
+T = TypeVar("T")
 
-def order_for_route_capture(kernels: list[type]) -> list[type]:
+
+def order_for_route_capture(
+    candidates: list[T], kernel_of: Callable[[T], type] = lambda kernel: kernel
+) -> list[T]:
     """Put modular experts ahead of monolithic ones while routes are captured.
 
     A monolithic kernel routes from the logits inside the fused op, so
@@ -28,6 +34,9 @@ def order_for_route_capture(kernels: list[type]) -> list[type]:
     same router with a different GEMM, and a capture pass exists to produce
     routes, not timings. The order is otherwise kept, so a backend with only a
     monolithic kernel still selects it and the capturer refuses it by name.
+
+    ``candidates`` are kernel classes, or anything ``kernel_of`` maps to one,
+    such as an oracle's backend enum.
     """
     from vllm.config import get_current_vllm_config
     from vllm.model_executor.layers.fused_moe.modular_kernel import (
@@ -36,8 +45,13 @@ def order_for_route_capture(kernels: list[type]) -> list[type]:
 
     vllm_config = get_current_vllm_config()
     if vllm_config is None or not vllm_config.model_config.enable_return_routed_experts:
-        return kernels
-    return sorted(kernels, key=lambda cls: issubclass(cls, FusedMoEExpertsMonolithic))
+        return candidates
+    return sorted(
+        candidates,
+        key=lambda candidate: issubclass(
+            kernel_of(candidate), FusedMoEExpertsMonolithic
+        ),
+    )
 
 
 def _get_num_experts_per_tok(hf_config) -> int:
