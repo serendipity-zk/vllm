@@ -7451,14 +7451,33 @@ class GPUModelRunner(
             BaseRouter,
         )
 
+        bound = 0
         for module in self.compilation_config.static_forward_context.values():
             if isinstance(module, FusedMoE) and isinstance(module.router, BaseRouter):
+                # A monolithic expert kernel does its own routing from the
+                # logits, so `MoERunner` never calls `select_experts` and the
+                # hook below is never reached -- the capture would come back a
+                # buffer of zeros, and nothing downstream could tell that apart
+                # from a model that routes to expert 0.
+                if module.quant_method is not None and module.quant_method.is_monolithic:
+                    raise ValueError(
+                        f"{module.layer_name}: routed-experts capture needs a modular MoE "
+                        "kernel, but this one routes inside the fused kernel. Select a "
+                        "modular backend, e.g. --kernel-config "
+                        '\'{"moe_backend": "flashinfer_cutlass"}\''
+                    )
                 layer_id = module.layer_id
 
                 def _capture_fn(topk_ids, _layer_id=layer_id, _capturer=capturer):
                     _capturer.capture(_layer_id, topk_ids)
 
                 module.router.set_capture_fn(_capture_fn)
+                bound += 1
+        if not bound:
+            raise ValueError(
+                "routed-experts capture found no routed MoE layer to bind; the "
+                "capture would be empty"
+            )
 
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
         """

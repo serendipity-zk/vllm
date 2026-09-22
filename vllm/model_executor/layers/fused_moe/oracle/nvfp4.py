@@ -6,6 +6,7 @@ import torch
 
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.config import get_current_vllm_config
 from vllm.config.kernel import MoEBackend
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
@@ -82,6 +83,19 @@ def backend_to_kernel_cls(
         )
 
         # NOTE: prefer Monolthic > Modular, so return Monolithic first.
+        #
+        # Unless routed experts are being captured: a monolithic kernel routes
+        # from the logits itself, so `MoERunner` never calls `select_experts`
+        # and the capture hook on the router is never reached. The modular
+        # kernel produces the same routing -- same router, same logits, a
+        # different GEMM -- and a capture pass exists to produce routes, not
+        # timings.
+        vllm_config = get_current_vllm_config()
+        if vllm_config is not None and vllm_config.model_config.enable_return_routed_experts:
+            return [
+                TrtLlmNvFp4ExpertsModular,
+                TrtLlmNvFp4ExpertsMonolithic,
+            ]
         return [
             TrtLlmNvFp4ExpertsMonolithic,
             TrtLlmNvFp4ExpertsModular,
