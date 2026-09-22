@@ -55,6 +55,22 @@ def get_num_experts(hf_config) -> int:
     )
 
 
+def num_capture_layers(vllm_config: VllmConfig) -> int:
+    """How many layer slots a capture buffer needs, drafter included.
+
+    An MTP drafter registers its layers starting at the target's depth
+    (``glm4_moe_mtp.py``: ``mtp_start_layer_idx = config.num_hidden_layers``),
+    so a buffer sized by ``num_hidden_layers`` alone is exactly one layer short
+    of the one a speculative deployment is being profiled for -- and
+    :meth:`RoutedExpertsCapturer.capture` would drop it.
+    """
+    hf_config = vllm_config.model_config.hf_text_config
+    num_layers = hf_config.num_hidden_layers
+    if vllm_config.speculative_config is not None:
+        num_layers += getattr(hf_config, "num_nextn_predict_layers", 0) or 0
+    return num_layers
+
+
 class RoutedExpertsCapturer:
     """Worker-side capturer for routed experts, lives on GPU.
 
@@ -93,7 +109,7 @@ class RoutedExpertsCapturer:
         self.device_buffer = torch.zeros(
             (
                 max_num_batched_tokens,
-                hf_config.num_hidden_layers,
+                num_capture_layers(vllm_config),
                 num_experts_per_tok,
             ),
             # Use int32 for the device / host transit buffers: it
@@ -195,10 +211,14 @@ class RoutedExpertsCapturer:
                     f"tp_size={self.tp_size})"
                 )
 
-        # Defensive: model may expose more layers than the capture buffer
-        # was sized for (unusual, but guards against miss-config).
+        # A layer that reports past the buffer is a sizing bug, and dropping it
+        # is the worst possible response: the hole is invisible until a corpus
+        # packed a GPU run later turns out to be missing a layer.
         if layer_id >= self.device_buffer.shape[1]:
-            return
+            raise AssertionError(
+                f"RoutedExpertsCapturer: layer {layer_id} reported routes but "
+                f"the buffer covers {self.device_buffer.shape[1]} layers"
+            )
 
         self.device_buffer[:token_num_per_dp, layer_id, :] = topk_ids[
             start_loc:end_loc, :
@@ -272,6 +292,9 @@ class RoutedExpertsManager:
         num_experts = get_num_experts(hf_config)
         num_experts_per_tok = _get_num_experts_per_tok(hf_config)
         max_num_slots = kv_cache_config.num_blocks * self.block_size
+        # Must match the worker's buffer: ``store_batch`` fancy-index assigns
+        # one into the other.
+        num_layers = num_capture_layers(vllm_config)
         # Expert IDs are 0..num_experts-1; uint8 fits 256 distinct
         # values so the boundary is ``<= 256`` (NOT ``< 256``). Keeping
         # this narrow matters because the slot buffer is sized for the
@@ -280,7 +303,7 @@ class RoutedExpertsManager:
         self.routed_experts_by_slot = np.zeros(
             (
                 max_num_slots,
-                hf_config.num_hidden_layers,
+                num_layers,
                 num_experts_per_tok,
             ),
             dtype=expert_id_dtype,
@@ -290,8 +313,8 @@ class RoutedExpertsManager:
             "(slots=%d, layers=%d, top_k=%d, dtype=%s)",
             self.routed_experts_by_slot.nbytes / 1e9,
             max_num_slots,
-            hf_config.num_hidden_layers,
-            hf_config.num_experts_per_tok,
+            num_layers,
+            num_experts_per_tok,
             self.routed_experts_by_slot.dtype.name,
         )
 

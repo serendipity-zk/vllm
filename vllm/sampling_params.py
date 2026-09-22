@@ -382,6 +382,7 @@ class SamplingParams(
         extra_args: dict[str, Any] | None = None,
         skip_clone: bool = False,
         repetition_detection: RepetitionDetectionParams | None = None,
+        routed_experts_prompt_start: int | None = 0,
     ) -> "SamplingParams":
         if logit_bias is not None:
             # Convert token_id to integer
@@ -423,6 +424,9 @@ class SamplingParams(
             extra_args=extra_args,
             skip_clone=skip_clone,
             repetition_detection=repetition_detection,
+            routed_experts_prompt_start=(
+                0 if routed_experts_prompt_start is None else routed_experts_prompt_start
+            ),
         )
 
     def __post_init__(self) -> None:

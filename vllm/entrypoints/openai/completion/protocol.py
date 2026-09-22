@@ -178,6 +178,17 @@ class CompletionRequest(OpenAIBaseModel):
         ),
     )
 
+    routed_experts_prompt_start: int | None = Field(
+        default=None,
+        description=(
+            "With enable_return_routed_experts, drop this many leading prompt "
+            "tokens from the returned routing. A capture that only wants the "
+            "generated tokens' routes sets this to len(prompt) - 1: the one "
+            "prompt row it keeps is the forward that produced the first "
+            "generated token, so every later row is a generated token's own."
+        ),
+    )
+
     repetition_detection: RepetitionDetectionParams | None = Field(
         default=None,
         description="Parameters for detecting repetitive N-gram patterns "
@@ -344,6 +355,7 @@ class CompletionRequest(OpenAIBaseModel):
             skip_clone=True,  # Created fresh per request, safe to skip clone
             repetition_detection=self.repetition_detection,
             thinking_token_budget=self.thinking_token_budget,
+            routed_experts_prompt_start=self.routed_experts_prompt_start,
         )
 
     @model_validator(mode="before")
