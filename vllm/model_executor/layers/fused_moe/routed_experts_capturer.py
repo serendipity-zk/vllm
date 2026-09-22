@@ -19,6 +19,27 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 logger = logging.getLogger(__name__)
 
 
+def order_for_route_capture(kernels: list[type]) -> list[type]:
+    """Put modular experts ahead of monolithic ones while routes are captured.
+
+    A monolithic kernel routes from the logits inside the fused op, so
+    ``MoERunner`` never calls ``select_experts`` and the router's capture hook
+    is never reached. A modular kernel reaches the same routing through the
+    same router with a different GEMM, and a capture pass exists to produce
+    routes, not timings. The order is otherwise kept, so a backend with only a
+    monolithic kernel still selects it and the capturer refuses it by name.
+    """
+    from vllm.config import get_current_vllm_config
+    from vllm.model_executor.layers.fused_moe.modular_kernel import (
+        FusedMoEExpertsMonolithic,
+    )
+
+    vllm_config = get_current_vllm_config()
+    if vllm_config is None or not vllm_config.model_config.enable_return_routed_experts:
+        return kernels
+    return sorted(kernels, key=lambda cls: issubclass(cls, FusedMoEExpertsMonolithic))
+
+
 def _get_num_experts_per_tok(hf_config) -> int:
     """Resolve the per-token expert count from the HF config.
 

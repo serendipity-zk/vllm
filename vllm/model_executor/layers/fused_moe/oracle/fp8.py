@@ -18,6 +18,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     fp8_w8a8_moe_quant_config,
     fp8_w8a16_moe_quant_config,
 )
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    order_for_route_capture,
+)
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     FlashinferMoeBackend,
     get_flashinfer_moe_backend,
@@ -117,7 +120,9 @@ def backend_to_kernel_cls(
             TrtLlmFp8ExpertsMonolithic,
         )
 
-        return [TrtLlmFp8ExpertsMonolithic, TrtLlmFp8ExpertsModular]
+        return order_for_route_capture(
+            [TrtLlmFp8ExpertsMonolithic, TrtLlmFp8ExpertsModular]
+        )
 
     elif backend == Fp8MoeBackend.FLASHINFER_CUTLASS:
         from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutlass_moe import (  # noqa: E501

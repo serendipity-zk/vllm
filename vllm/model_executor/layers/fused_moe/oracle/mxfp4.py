@@ -26,6 +26,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     mxfp4_w4a16_moe_quant_config,
     ocp_mx_moe_quant_config,
 )
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    order_for_route_capture,
+)
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import _swizzle_mxfp4
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -129,7 +132,9 @@ def backend_to_kernel_cls(
         )
 
         # NOTE: prefer Monolithic > Modular, so return Monolithic first.
-        return [TrtLlmMxfp4ExpertsMonolithic, TrtLlmMxfp4ExpertsModular]
+        return order_for_route_capture(
+            [TrtLlmMxfp4ExpertsMonolithic, TrtLlmMxfp4ExpertsModular]
+        )
 
     elif backend in (
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
@@ -148,7 +153,9 @@ def backend_to_kernel_cls(
         )
 
         # NOTE: prefer Monolithic > Modular, so return Monolithic first.
-        return [OAITritonMxfp4ExpertsMonolithic, OAITritonExperts]
+        return order_for_route_capture(
+            [OAITritonMxfp4ExpertsMonolithic, OAITritonExperts]
+        )
 
     elif backend == Mxfp4MoeBackend.TRITON_UNFUSED:
         from vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe import (  # noqa: E501

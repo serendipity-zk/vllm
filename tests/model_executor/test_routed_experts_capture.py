@@ -280,3 +280,33 @@ def test_an_unpadded_drafter_is_refused_rather_than_captured_as_zeros():
     )
     with pytest.raises(ValueError, match="padded drafter batch"):
         gmr.GPUModelRunner.init_routed_experts_capturer(runner)
+
+
+@pytest.mark.parametrize("capturing", [False, True])
+def test_a_capture_prefers_the_kernel_that_calls_the_router(capturing):
+    """A monolithic kernel routes inside the fused op and bypasses the hook."""
+    import vllm.config as vllm_config_module
+    from vllm.model_executor.layers.fused_moe.modular_kernel import (
+        FusedMoEExpertsMonolithic,
+    )
+    from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+        order_for_route_capture,
+    )
+
+    class Fused(FusedMoEExpertsMonolithic):
+        pass
+
+    class Modular:
+        pass
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(enable_return_routed_experts=capturing)
+    )
+    with patch.object(
+        vllm_config_module, "get_current_vllm_config", return_value=config
+    ):
+        ordered = order_for_route_capture([Fused, Modular])
+        alone = order_for_route_capture([Fused])
+
+    assert ordered == ([Modular, Fused] if capturing else [Fused, Modular])
+    assert alone == [Fused], "a backend with no modular kernel is left to refuse"
