@@ -17,6 +17,9 @@ from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    RoutedExpertsCapturer,
+)
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import supports_multimodal
 from vllm.model_executor.models.deepseek_eagle3 import Eagle3DeepseekV2ForCausalLM
@@ -71,6 +74,8 @@ class SpecDecodeBaseProposer:
         self.method = self.speculative_config.method
         self.pass_hidden_states_to_model = pass_hidden_states_to_model
         self._share_mtp_indices = False
+        # Set by the model runner when routed-experts capture is on.
+        self.routed_experts_capturer: RoutedExpertsCapturer | None = None
 
         self.device = device
         self.dtype = vllm_config.model_config.dtype
@@ -583,6 +588,10 @@ class SpecDecodeBaseProposer:
             common_attn_metadata._seq_lens_cpu = None
             common_attn_metadata._num_computed_tokens_cpu = None
 
+        # Only the first pass ran over the target's token rows; keep its routes.
+        capturer = self.routed_experts_capturer
+        held_routes = capturer.hold_draft_layers() if capturer is not None else None
+
         block_size = self.block_size
         assert block_size > 0, "block_size has not been initialized."
         for token_index in range(self.num_speculative_tokens - 1):
@@ -654,6 +663,9 @@ class SpecDecodeBaseProposer:
                 assert draft_probs_list is not None
                 draft_probs_list.append(draft_probs)
             draft_token_ids_list.append(draft_token_ids)
+
+        if capturer is not None:
+            capturer.restore_draft_layers(held_routes)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)

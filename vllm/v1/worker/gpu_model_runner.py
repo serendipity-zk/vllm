@@ -180,6 +180,7 @@ from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
+from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer_gpu import (
@@ -7414,6 +7415,8 @@ class GPUModelRunner(
         )
         self.routed_experts_attn_gid = self._get_attention_kv_cache_gid()
         self._bind_routed_experts_capturer(self.routed_experts_capturer)
+        if isinstance(getattr(self, "drafter", None), SpecDecodeBaseProposer):
+            self.drafter.routed_experts_capturer = self.routed_experts_capturer
 
         # Pinned CPU buffer for non-blocking D2H of ``routing_data`` on
         # the sync scheduling path. Shape / dtype mirror the device
@@ -7459,11 +7462,12 @@ class GPUModelRunner(
                 # hook below is never reached -- the capture would come back a
                 # buffer of zeros, and nothing downstream could tell that apart
                 # from a model that routes to expert 0.
-                if module.quant_method is not None and module.quant_method.is_monolithic:
+                quant_method = module.quant_method
+                if quant_method is not None and quant_method.is_monolithic:
                     raise ValueError(
-                        f"{module.layer_name}: routed-experts capture needs a modular MoE "
-                        "kernel, but this one routes inside the fused kernel. Select a "
-                        "modular backend, e.g. --kernel-config "
+                        f"{module.layer_name}: routed-experts capture needs a "
+                        "modular MoE kernel, but this one routes inside the fused "
+                        "kernel. Select a modular backend, e.g. --kernel-config "
                         '\'{"moe_backend": "flashinfer_cutlass"}\''
                     )
                 layer_id = module.layer_id

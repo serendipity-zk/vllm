@@ -119,6 +119,7 @@ def test_gpu_model_runner_binds_router_capture(monkeypatch):
         def __init__(self):
             self.layer_id = 7
             self.router = _make_router()
+            self.quant_method = None
 
     class DummyCapturer:
         def __init__(self):
@@ -159,6 +160,7 @@ def test_gpu_model_runner_binding_stage(monkeypatch):
         def __init__(self):
             self.layer_id = 11
             self.router = _make_router()
+            self.quant_method = None
 
     class DummyCapturer:
         def __init__(self):
@@ -247,3 +249,22 @@ def test_routed_experts_capturer_dp_unexpected_batch_raises():
     ):
         capturer.capture(layer_id=0, topk_ids=topk)
     assert capturer.device_buffer[0, 0, 0].item() == -1
+
+
+def test_later_draft_passes_cannot_overwrite_the_first_passs_routes():
+    """A per-request draft pass must not relabel the target-aligned rows."""
+    capturer = _capturer_with_buffer(num_layers=3)
+    capturer.first_draft_layer = 2
+    ctx = SimpleNamespace(dp_metadata=None)
+    target = torch.tensor([[1, 2]] * 6, dtype=torch.int32)
+    first_pass = torch.arange(12, dtype=torch.int32).view(6, 2)
+    with patch(f"{_REC_MODULE}.get_forward_context", return_value=ctx):
+        capturer.capture(layer_id=0, topk_ids=target)
+        capturer.capture(layer_id=2, topk_ids=first_pass)
+        held = capturer.hold_draft_layers()
+        # Two requests, one row each: rows 0 and 1 belong to other tokens.
+        capturer.capture(layer_id=2, topk_ids=torch.tensor([[40, 41], [42, 43]]))
+    capturer.restore_draft_layers(held)
+
+    assert torch.equal(capturer.device_buffer[:6, 2, :], first_pass)
+    assert torch.equal(capturer.device_buffer[:6, 0, :], target)

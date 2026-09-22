@@ -122,6 +122,8 @@ class RoutedExpertsCapturer:
         )
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+        # Slots from here on belong to the drafter (see num_capture_layers).
+        self.first_draft_layer = hf_config.num_hidden_layers
 
     def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
         """Capture expert routing decisions for a specific layer.
@@ -230,6 +232,23 @@ class RoutedExpertsCapturer:
         the next step.
         """
         self.device_buffer.zero_()
+
+    def hold_draft_layers(self) -> torch.Tensor:
+        """Copy the drafter's slots as its first pass left them.
+
+        Only the first draft pass runs over the target's token rows; each later
+        pass runs one row per request and would write those rows over the first
+        ``num_reqs`` token rows, attaching one request's draft routes to another
+        request's tokens. The write sits inside the MoE forward and is replayed
+        from CUDA graphs, so it cannot be switched off per pass -- the proposer
+        holds the first pass's slots here and puts them back with
+        :meth:`restore_draft_layers` once drafting is done.
+        """
+        return self.device_buffer[:, self.first_draft_layer :].clone()
+
+    def restore_draft_layers(self, held: torch.Tensor) -> None:
+        """Undo every draft pass after the one :meth:`hold_draft_layers` saw."""
+        self.device_buffer[:, self.first_draft_layer :].copy_(held)
 
     def get_device_buffer(self) -> torch.Tensor:
         """Return the underlying device buffer so the model runner can
