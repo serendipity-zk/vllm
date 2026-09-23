@@ -14,6 +14,7 @@ from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     bind_routed_experts_capturer,
+    num_capture_layers,
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 from vllm.v1.kv_cache_interface import (
@@ -99,6 +100,41 @@ def _full_attention_kv_group(
             kv_cache_specs={"layer": full_attention},
         ),
     )
+
+
+@pytest.mark.parametrize(
+    ("method", "expected"), [(None, 3), ("mtp", 4), ("eagle", 3), ("ngram", 3)]
+)
+def test_capture_slots_cover_mtp_drafter_layers_only(method, expected):
+    """An MTP drafter's layers follow the target's; no other drafter runs them."""
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            get_total_num_hidden_layers=lambda: 3,
+            hf_text_config=SimpleNamespace(num_nextn_predict_layers=1),
+        ),
+        speculative_config=None if method is None else SimpleNamespace(method=method),
+    )
+
+    assert num_capture_layers(vllm_config) == expected
+
+
+def test_draft_routes_keep_the_first_pass_and_reach_the_snapshot():
+    """Later draft passes must not overwrite the first pass's token rows, and a
+    snapshot taken before drafting must end up with this step's draft routes."""
+    capturer = _capturer_with_buffer(max_tokens=4, num_layers=3)
+    capturer.first_draft_layer = 2
+    assert capturer.records_drafter
+    capturer.device_buffer[:, 2] = 9  # previous step's draft routes
+    snapshot = capturer.snapshot_routing_data(3)
+
+    capturer.device_buffer[:3, 2] = torch.tensor([[1, 2], [3, 4], [5, 6]])
+    held = capturer.hold_draft_layers()
+    capturer.device_buffer[:2, 2] = 0  # a later pass, one row per request
+    capturer.restore_draft_layers(held)
+    capturer.refresh_draft_layers(snapshot)
+
+    assert snapshot[:, 2].tolist() == [[1, 2], [3, 4], [5, 6]]
+    assert snapshot[:, :2].tolist() == [[[255, 255]] * 2] * 3
 
 
 @pytest.mark.parametrize("eplb_enabled", [False, True])
@@ -459,6 +495,77 @@ def test_aux_output_worker_connector_default_capacity(monkeypatch):
     assert store_constructor.call_args.kwargs["max_bytes"] == 2560
     assert store_constructor.call_args.kwargs["object_nbytes"] == 128
     assert background_store_constructor.call_args.kwargs["max_pending_batches"] == 16
+
+
+def test_mrv2_binds_mtp_drafter_and_rejects_other_drafters(monkeypatch):
+    pytest.importorskip("vllm.vllm_flash_attn", exc_type=ImportError)
+    import vllm.v1.worker.gpu.model_runner as model_runner
+
+    capturer = Mock(records_drafter=True)
+    bind = Mock()
+    monkeypatch.setattr(model_runner, "bind_routed_experts_capturer", bind)
+    runner = model_runner.GPUModelRunner.__new__(model_runner.GPUModelRunner)
+
+    from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+
+    speculator = MTPSpeculator.__new__(MTPSpeculator)
+    speculator.model = Mock()
+    runner.speculator = speculator
+    runner._bind_drafter_routed_experts_capture(capturer)
+    assert bind.call_args_list[-1].args == (speculator.model, capturer)
+    assert speculator.routed_experts_capturer is capturer
+
+    runner.speculator = Mock()
+    with pytest.raises(ValueError, match="single-module MTP drafter"):
+        runner._bind_drafter_routed_experts_capture(capturer)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_mrv2_async_output_copies_routes_completed_after_construction():
+    from vllm.v1.outputs import ModelRunnerOutput
+    from vllm.v1.worker.gpu.async_utils import AsyncOutput
+    from vllm.v1.worker.gpu.sample.output import SamplerOutput
+
+    class FakePendingAuxOutput:
+        def __init__(self, routed_experts_gpu):
+            self.routed_experts_gpu = routed_experts_gpu
+            self.routed_experts = None
+
+        def enqueue_cpu_copy(self, num_sampled, num_rejected):
+            self.routed_experts = self.routed_experts_gpu.to(
+                "cpu", non_blocking=True
+            ).numpy()
+
+        def process_output(self):
+            return {"req": self.routed_experts}
+
+    num_sampled = torch.tensor([1], dtype=torch.int32, device="cuda")
+    main_stream = torch.cuda.current_stream()
+    copy_stream = torch.cuda.Stream()
+    async_output = AsyncOutput(
+        model_runner_output=ModelRunnerOutput(req_ids=["req"], req_id_to_index={}),
+        sampler_output=SamplerOutput(
+            sampled_token_ids=torch.tensor([[1]], device="cuda"),
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=torch.tensor([0], dtype=torch.int32, device="cuda"),
+        ),
+        num_sampled_tokens=num_sampled,
+        main_stream=main_stream,
+        copy_stream=copy_stream,
+        check_ep_fault=False,
+        pending_aux_output=None,
+    )
+    routing_data = torch.zeros(2, 2, 1, dtype=torch.uint8, device="cuda")
+    routing_data[:, 1] = 7  # the drafter's slot, written after construction
+    async_output.copy_aux_output(
+        FakePendingAuxOutput(routing_data), main_stream, copy_stream
+    )
+
+    output = async_output.get_output()
+    routes = output.aux_output_connector_output["req"]
+    assert routes[:, 1, 0].tolist() == [7, 7]
 
 
 def test_v2_model_runner_accepts_routed_experts(monkeypatch):

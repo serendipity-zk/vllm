@@ -166,6 +166,23 @@ class AsyncOutput(AsyncModelRunnerOutput):
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
             self.copy_event.record(copy_stream)
 
+    def copy_aux_output(
+        self,
+        pending_aux_output: "PendingAuxOutput",
+        main_stream: torch.cuda.Stream,
+        copy_stream: torch.cuda.Stream,
+    ) -> None:
+        """Copy auxiliary output completed after construction (drafter routes)."""
+        assert self.pending_aux_output is None
+        self.pending_aux_output = pending_aux_output
+        with stream(copy_stream, main_stream):
+            copy_stream.wait_stream(main_stream)
+            pending_aux_output.enqueue_cpu_copy(
+                num_sampled=self.num_sampled_tokens_np,
+                num_rejected=async_copy_to_np(self.sampler_output.num_rejected),
+            )
+            self.copy_event.record(copy_stream)
+
     def get_output(self) -> ModelRunnerOutput:
         self.copy_event.synchronize()
 

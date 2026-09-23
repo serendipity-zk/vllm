@@ -163,6 +163,9 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
 )
+from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
+    AutoRegressiveSpeculator,
+)
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
     verify_supports_aux_hidden_states_over_pp,
@@ -369,6 +372,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
         self.req_states.max_model_len = max_model_len
+
+    def _bind_drafter_routed_experts_capture(
+        self, capturer: RoutedExpertsCapturer
+    ) -> None:
+        """Bind the single-module MTP drafter to the routed-experts capturer."""
+        # The multi-module drafter runs a different layer per pass, so its
+        # later layers see one row per request instead of token rows.
+        speculator = self.speculator
+        if not isinstance(speculator, AutoRegressiveSpeculator):
+            raise ValueError(
+                "Routed-experts capture records MTP drafter layers only "
+                "with a single-module MTP drafter, got "
+                f"{type(speculator).__name__}."
+            )
+        bind_routed_experts_capturer(speculator.model, capturer)
+        speculator.routed_experts_capturer = capturer
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         tasks: list[SupportedTask] = []
@@ -776,6 +795,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.alignment_routing_capturer = (
                     self.aux_output_connector.routed_experts_capturer
                 )
+                if self.alignment_routing_capturer.records_drafter:
+                    self._bind_drafter_routed_experts_capture(
+                        self.alignment_routing_capturer
+                    )
             elif is_routing_trace_enabled():
                 # The routing dump reads raw topk_ids; its env var alone brings
                 # up a capturer without returning routes on responses.
@@ -2156,6 +2179,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 pending_aux_output = self.aux_output_connector.prepare_output(
                     input_batch
                 )
+            # The drafter's routes exist only once it has run.
+            draft_routes_pending = (
+                pending_aux_output is not None
+                and self.aux_output_connector is not None
+                and self.aux_output_connector.routed_experts_capturer.records_drafter
+            )
 
             # Start async output copy here to overlap with speculator proposal.
             async_output = AsyncOutput(
@@ -2165,7 +2194,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 main_stream=self.main_stream,
                 copy_stream=self.output_copy_stream,
                 check_ep_fault=self.check_ep_fault,
-                pending_aux_output=pending_aux_output,
+                pending_aux_output=(
+                    None if draft_routes_pending else pending_aux_output
+                ),
             )
 
             mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
@@ -2244,6 +2275,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
 
         with alignment_phase(iteration_index, "bookkeep"):
+            if draft_routes_pending:
+                assert self.aux_output_connector is not None
+                assert pending_aux_output is not None
+                self.aux_output_connector.routed_experts_capturer.refresh_draft_layers(
+                    pending_aux_output.routed_experts_gpu
+                )
+                async_output.copy_aux_output(
+                    pending_aux_output, self.main_stream, self.output_copy_stream
+                )
             if self.num_speculative_steps > 0:
                 # Spec-decode and diffusion LLMs both use draft tokens;
                 # diffusion has no speculator (self.speculator is None).
