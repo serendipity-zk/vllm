@@ -200,9 +200,10 @@ class EplbModelState:
     """
     CUDA device index for the async EPLB worker thread.
     """
-    communicator: EplbCommunicator
+    communicator: EplbCommunicator | None
     """
-    The communicator for expert weight transfers.
+    The communicator for expert weight transfers; None when EPLB never
+    rearranges.
     """
     pending_result: AsyncEplbLayerResult | None = None
     """
@@ -261,6 +262,10 @@ class EplbState:
         :class:`EplbLayerState` holds a reference to the **same** object so
         a single ``.fill_()`` updates all layers at once.  Allocated on the
         first call to :meth:`_init_should_record_tensor`.
+        """
+        self.rearranges: bool = parallel_config.eplb_config.rearrange
+        """
+        Whether EPLB moves experts; False records expert load only.
         """
         self.is_async: bool = False
         """
@@ -363,7 +368,7 @@ class EplbState:
         if max_forwards_per_step <= 0:
             raise ValueError("max_forwards_per_step must be positive")
         self.validate_ep_configuration(model)
-        self.is_async = self.parallel_config.eplb_config.use_async
+        self.is_async = self.parallel_config.eplb_config.use_async and self.rearranges
 
         physical_to_logical_map_list = (
             EplbState.build_initial_global_physical_to_logical_map(
@@ -460,18 +465,28 @@ class EplbState:
             logical_replica_count,
         )
         self._init_should_record_tensor(model)
-        expert_buffer = [torch.empty_like(w) for w in model.expert_weights[0]]
+        # The transfer buffer is one layer of expert weights -- gigabytes for a
+        # BF16 drafter layer -- so a record-only EPLB does not allocate it.
+        expert_buffer = (
+            [torch.empty_like(w) for w in model.expert_weights[0]]
+            if self.rearranges
+            else []
+        )
         experts_per_token_values = {layer.top_k for layer in model.moe_layers}
         assert len(experts_per_token_values) == 1, (
             "all EPLB-managed MoE layers must use the same experts_per_token"
         )
         experts_per_token = experts_per_token_values.pop()
 
-        communicator = create_eplb_communicator(
-            group_coordinator=get_eplb_group(),
-            backend=self.parallel_config.eplb_config.communicator,
-            expert_weights=model.expert_weights,
-            expert_buffer=expert_buffer,
+        communicator = (
+            create_eplb_communicator(
+                group_coordinator=get_eplb_group(),
+                backend=self.parallel_config.eplb_config.communicator,
+                expert_weights=model.expert_weights,
+                expert_buffer=expert_buffer,
+            )
+            if self.rearranges
+            else None
         )
 
         model_state = EplbModelState(
@@ -521,7 +536,8 @@ class EplbState:
         """
         ep_group = get_ep_group().device_group
         if is_profile:
-            self.rearrange(is_profile=True)
+            if self.rearranges:
+                self.rearrange(is_profile=True)
             return
 
         if is_dummy:
@@ -644,7 +660,11 @@ class EplbState:
                         ep_rank=ep_group.rank(),
                     )
 
-        if self.expert_rearrangement_step >= self.expert_rearrangement_step_interval:
+        if (
+            self.rearranges
+            and self.expert_rearrangement_step
+            >= self.expert_rearrangement_step_interval
+        ):
             if self.is_async and any(
                 eplb_model_state.rebalanced
                 for eplb_model_state in self.model_states.values()
@@ -669,7 +689,9 @@ class EplbState:
         steps_remaining = (
             self.expert_rearrangement_step_interval - self.expert_rearrangement_step
         )
-        should_record_for_rearrange = steps_remaining <= self.expert_load_window_size
+        should_record_for_rearrange = (
+            self.rearranges and steps_remaining <= self.expert_load_window_size
+        )
 
         if not log_stats:
             return should_record_for_rearrange
