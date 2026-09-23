@@ -8,6 +8,9 @@ import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    RoutedExpertsCapturer,
+)
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
@@ -32,6 +35,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
         self.prefill_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
+        # Set by the model runner when it binds the drafter for routed-experts
+        # capture.
+        self.routed_experts_capturer: RoutedExpertsCapturer | None = None
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         # Subclasses create prefill_cudagraph_manager before calling this.
@@ -173,6 +179,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         is_profile: bool,
         num_speculative_steps: int,
     ) -> None:
+        # Only the prefill ran over the target's token rows; keep its routes.
+        capturer = self.routed_experts_capturer
+        held_routes = capturer.hold_draft_layers() if capturer is not None else None
+
         decode_batch_sync, num_batch_tokens = None, num_reqs
         if dp_sync_state is not None:
             # Padded dummy batches can exceed the requests the DP sync covers.
@@ -221,6 +231,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             num_speculative_steps,
         )
         self.on_multi_step_decode_end(num_reqs)
+
+        if held_routes is not None:
+            assert capturer is not None
+            capturer.restore_draft_layers(held_routes)
 
     def _multi_step_decode(
         self,
