@@ -157,6 +157,9 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
     maybe_create_adaptive_verification_manager,
 )
+from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
+    AutoRegressiveSpeculator,
+)
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
     verify_supports_aux_hidden_states_over_pp,
@@ -367,13 +370,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.req_states.max_model_len = max_model_len
 
     def init_routed_experts_capturer(self) -> None:
-        """Initialize target-model capture on every participating worker."""
-        self.routed_experts_capturer = RoutedExpertsCapturer(
+        """Initialize capture on every participating worker."""
+        capturer = RoutedExpertsCapturer(
             max_num_batched_tokens=self.max_num_tokens,
             vllm_config=self.vllm_config,
             kv_cache_config=self.kv_cache_config,
         )
-        bind_routed_experts_capturer(self.model, self.routed_experts_capturer)
+        bind_routed_experts_capturer(self.model, capturer)
+        if capturer.records_drafter:
+            # The multi-module drafter runs a different layer per pass, so its
+            # later layers see one row per request instead of token rows.
+            speculator = self.speculator
+            if not isinstance(speculator, AutoRegressiveSpeculator):
+                raise ValueError(
+                    "Routed-experts capture records MTP drafter layers only "
+                    "with a single-module MTP drafter, got "
+                    f"{type(speculator).__name__}."
+                )
+            bind_routed_experts_capturer(speculator.model, capturer)
+            speculator.routed_experts_capturer = capturer
+        self.routed_experts_capturer = capturer
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         tasks: list[SupportedTask] = []
@@ -2022,6 +2038,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
                 cudagraph_stats=cudagraph_stats,
             )
+            # The drafter's routes exist only once it has run.
+            capturer = self.routed_experts_capturer
+            draft_routes_pending = (
+                routed_experts is not None
+                and capturer is not None
+                and capturer.records_drafter
+            )
             # Start async output copy here to overlap with speculator proposal.
             async_output = AsyncOutput(
                 model_runner_output=model_runner_output,
@@ -2030,7 +2053,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 main_stream=self.main_stream,
                 copy_stream=self.output_copy_stream,
                 check_ep_fault=self.check_ep_fault,
-                routed_experts=routed_experts,
+                routed_experts=None if draft_routes_pending else routed_experts,
             )
 
             mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
@@ -2092,6 +2115,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
 
         with alignment_phase(iteration_index, "bookkeep"):
+            if draft_routes_pending:
+                assert capturer is not None and routed_experts is not None
+                capturer.refresh_draft_layers(routed_experts)
+                async_output.copy_routed_experts(
+                    routed_experts, self.main_stream, self.output_copy_stream
+                )
             if self.num_speculative_steps > 0:
                 # Spec-decode and diffusion LLMs both use draft tokens;
                 # diffusion has no speculator (self.speculator is None).

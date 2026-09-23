@@ -164,6 +164,20 @@ class AsyncOutput(AsyncModelRunnerOutput):
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
             self.copy_event.record(copy_stream)
 
+    def copy_routed_experts(
+        self,
+        routed_experts: RoutedExpertsTensors,
+        main_stream: torch.cuda.Stream,
+        copy_stream: torch.cuda.Stream,
+    ) -> None:
+        """Copy routes that were completed after construction (drafter layers)."""
+        assert self.routed_experts is None
+        self.routed_experts = routed_experts
+        with stream(copy_stream, main_stream):
+            copy_stream.wait_stream(main_stream)
+            self.routed_experts_cpu = routed_experts.to_cpu_nonblocking()
+            self.copy_event.record(copy_stream)
+
     def get_output(self) -> ModelRunnerOutput:
         self.copy_event.synchronize()
 

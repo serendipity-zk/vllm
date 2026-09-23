@@ -7622,6 +7622,12 @@ class GPUModelRunner(
             vllm_config=self.vllm_config,
             kv_cache_config=self.kv_cache_config,
         )
+        if self.routed_experts_capturer.records_drafter:
+            # Only model runner V2 binds the drafter; its slots would stay zero.
+            raise ValueError(
+                "Routed-experts capture of MTP drafter layers requires model "
+                "runner V2; unset VLLM_USE_V2_MODEL_RUNNER=0."
+            )
         bind_routed_experts_capturer(self.model, self.routed_experts_capturer)
 
         # Pinned CPU buffer for non-blocking D2H of ``routing_data`` on

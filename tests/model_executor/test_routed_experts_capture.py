@@ -16,6 +16,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsManager,
     bind_routed_experts_capturer,
     get_routed_experts_attn_gid,
+    num_capture_layers,
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 from vllm.transformers_utils.model_arch_config_convertor import (
@@ -112,7 +113,9 @@ def test_routed_experts_manager_uses_gemma4_top_k_experts():
         top_k_experts=2,
         num_hidden_layers=3,
     )
-    vllm_config = SimpleNamespace(model_config=_make_model_config(hf_config))
+    vllm_config = SimpleNamespace(
+        model_config=_make_model_config(hf_config), speculative_config=None
+    )
     kv_cache_spec = FullAttentionSpec(
         block_size=4,
         num_kv_heads=1,
@@ -136,7 +139,9 @@ def test_routed_experts_manager_uses_kimi_k3_experts_per_token():
         num_experts_per_token=2,
         num_hidden_layers=3,
     )
-    vllm_config = SimpleNamespace(model_config=_make_model_config(hf_config))
+    vllm_config = SimpleNamespace(
+        model_config=_make_model_config(hf_config), speculative_config=None
+    )
     kv_cache_spec = FullAttentionSpec(
         block_size=4,
         num_kv_heads=1,
@@ -152,6 +157,49 @@ def test_routed_experts_manager_uses_kimi_k3_experts_per_token():
     manager = RoutedExpertsManager(vllm_config, kv_cache_config)
 
     assert manager.routed_experts_by_slot.shape == (8, 3, 2)
+
+
+@pytest.mark.parametrize(
+    ("method", "expected"), [(None, 3), ("mtp", 4), ("eagle", 3), ("ngram", 3)]
+)
+def test_capture_slots_cover_mtp_drafter_layers_only(method, expected):
+    """An MTP drafter's layers follow the target's; no other drafter runs them."""
+    hf_config = SimpleNamespace(
+        num_experts=8,
+        num_experts_per_token=2,
+        num_hidden_layers=3,
+        num_nextn_predict_layers=1,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=_make_model_config(hf_config),
+        speculative_config=None if method is None else SimpleNamespace(method=method),
+    )
+
+    assert num_capture_layers(vllm_config) == expected
+
+
+def test_draft_routes_keep_the_first_pass_and_reach_the_snapshot():
+    """Later draft passes must not overwrite the first pass's token rows, and a
+    snapshot taken before drafting must end up with this step's draft routes."""
+    from vllm.v1.outputs import RoutedExpertsTensors
+
+    capturer = _capturer_with_buffer(max_tokens=4, num_layers=3)
+    capturer.first_draft_layer = 2
+    assert capturer.records_drafter
+    capturer.device_buffer[:, 2] = 9  # previous step's draft routes
+    snapshot = RoutedExpertsTensors(
+        routing_data=capturer.device_buffer[:3].clone(),
+        slot_mapping=torch.arange(3),
+    )
+
+    capturer.device_buffer[:3, 2] = torch.tensor([[1, 2], [3, 4], [5, 6]])
+    held = capturer.hold_draft_layers()
+    capturer.device_buffer[:2, 2] = 0  # a later pass, one row per request
+    capturer.restore_draft_layers(held)
+    capturer.refresh_draft_layers(snapshot)
+
+    assert snapshot.routing_data[:, 2].tolist() == [[1, 2], [3, 4], [5, 6]]
+    assert snapshot.routing_data[:, :2].tolist() == [[[-1, -1]] * 2] * 3
 
 
 def test_base_router_capture_pre_eplb_mapping():
@@ -425,6 +473,7 @@ def test_all_tp_ranks_initialize_capture(monkeypatch, rank):
     runner.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(rank=rank))
     runner.kv_cache_config = SimpleNamespace()
     runner.model = Mock()
+    capturer.records_drafter = False
 
     runner.init_routed_experts_capturer()
 
@@ -435,6 +484,71 @@ def test_all_tp_ranks_initialize_capture(monkeypatch, rank):
     )
     bind.assert_called_once_with(runner.model, capturer)
     assert runner.routed_experts_capturer is capturer
+
+
+def test_mrv2_binds_mtp_drafter_and_rejects_other_drafters(monkeypatch):
+    pytest.importorskip("vllm.vllm_flash_attn", exc_type=ImportError)
+    import vllm.v1.worker.gpu.model_runner as model_runner
+
+    capturer = Mock(records_drafter=True)
+    bind = Mock()
+    monkeypatch.setattr(
+        model_runner, "RoutedExpertsCapturer", Mock(return_value=capturer)
+    )
+    monkeypatch.setattr(model_runner, "bind_routed_experts_capturer", bind)
+    runner = model_runner.GPUModelRunner.__new__(model_runner.GPUModelRunner)
+    runner.max_num_tokens = 32
+    runner.vllm_config = SimpleNamespace()
+    runner.kv_cache_config = SimpleNamespace()
+    runner.model = Mock()
+
+    from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+
+    speculator = MTPSpeculator.__new__(MTPSpeculator)
+    speculator.model = Mock()
+    runner.speculator = speculator
+    runner.init_routed_experts_capturer()
+    assert bind.call_args_list[-1].args == (speculator.model, capturer)
+    assert speculator.routed_experts_capturer is capturer
+
+    runner.speculator = Mock()
+    with pytest.raises(ValueError, match="single-module MTP drafter"):
+        runner.init_routed_experts_capturer()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_mrv2_async_output_copies_routes_completed_after_construction():
+    from vllm.v1.outputs import ModelRunnerOutput, RoutedExpertsTensors
+    from vllm.v1.worker.gpu.async_utils import AsyncOutput
+    from vllm.v1.worker.gpu.sample.output import SamplerOutput
+
+    num_sampled = torch.tensor([1], dtype=torch.int32, device="cuda")
+    main_stream = torch.cuda.current_stream()
+    copy_stream = torch.cuda.Stream()
+    async_output = AsyncOutput(
+        model_runner_output=ModelRunnerOutput(req_ids=["req"], req_id_to_index={}),
+        sampler_output=SamplerOutput(
+            sampled_token_ids=torch.tensor([[1]], device="cuda"),
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=torch.tensor([0], dtype=torch.int32, device="cuda"),
+        ),
+        num_sampled_tokens=num_sampled,
+        main_stream=main_stream,
+        copy_stream=copy_stream,
+    )
+    routing_data = torch.zeros(2, 2, 1, dtype=torch.int32, device="cuda")
+    routing_data[:, 1] = 7  # the drafter's slot, written after construction
+    async_output.copy_routed_experts(
+        RoutedExpertsTensors(routing_data, torch.tensor([4, 5], device="cuda")),
+        main_stream,
+        copy_stream,
+    )
+
+    output = async_output.get_output()
+    assert output.routed_experts is not None
+    assert output.routed_experts.routing_data[:, 1, 0].tolist() == [7, 7]
 
 
 def test_v2_model_runner_accepts_routed_experts(monkeypatch):
