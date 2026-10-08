@@ -19,7 +19,7 @@ import regex as re
 import torch
 from torch import nn
 
-from vllm.config import VllmConfig, replace, set_current_vllm_config
+from vllm.config import AuxOutputConfig, VllmConfig, replace, set_current_vllm_config
 from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
@@ -156,6 +156,9 @@ def _make_draft_vllm_config(
     draft_vllm_config = replace(
         vllm_config,
         model_config=speculative_config.draft_model_config,
+        # The target owns returned routing and binds the drafter to its capturer.
+        # A draft runner must not construct a second generate-only connector.
+        aux_output_config=AuxOutputConfig(),
     )
     # VllmConfig post-init derives the target quant config, so restore the
     # independently resolved draft quant config after replacement.

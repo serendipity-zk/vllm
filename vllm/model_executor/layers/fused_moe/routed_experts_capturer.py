@@ -44,7 +44,17 @@ def num_capture_layers(vllm_config: VllmConfig) -> int:
     spec_config = getattr(vllm_config, "speculative_config", None)
     if spec_config is not None and spec_config.method == "mtp":
         hf_config = vllm_config.model_config.hf_text_config
-        num_layers += getattr(hf_config, "num_nextn_predict_layers", 0) or 0
+        num_draft_layers = getattr(hf_config, "num_nextn_predict_layers", 0) or 0
+        if getattr(hf_config, "model_type", None) in (
+            "qwen4_exp",
+            "qwen4_exp_text",
+        ):
+            # Qwen4Exp names its standalone MTP layers differently. Do not
+            # add both fields: they describe the same physical drafter.
+            num_draft_layers = getattr(
+                hf_config, "mtp_num_hidden_layers", num_draft_layers
+            )
+        num_layers += num_draft_layers or 0
     return num_layers
 
 
